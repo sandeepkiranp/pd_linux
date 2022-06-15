@@ -145,6 +145,8 @@ static char __init *dm_parse_table_entry(struct dm_device *dev, char *str)
 	if (!dev->target_args_array[n])
 		return ERR_PTR(-ENOMEM);
 
+	printk("sector_start %d, length %d, target name %s\n", sp->sector_start, sp->length, sp->target_type);
+
 	return next;
 }
 

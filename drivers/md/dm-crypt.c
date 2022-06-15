@@ -134,7 +134,7 @@ struct iv_elephant_private {
 enum flags { DM_CRYPT_SUSPENDED, DM_CRYPT_KEY_VALID,
 	     DM_CRYPT_SAME_CPU, DM_CRYPT_NO_OFFLOAD,
 	     DM_CRYPT_NO_READ_WORKQUEUE, DM_CRYPT_NO_WRITE_WORKQUEUE,
-	     DM_CRYPT_WRITE_INLINE };
+	     DM_CRYPT_WRITE_INLINE,DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD};
 
 enum cipher_flags {
 	CRYPT_MODE_INTEGRITY_AEAD,	/* Use authenticated mode for cipher */
@@ -240,6 +240,22 @@ static struct scatterlist *crypt_get_sg_data(struct crypt_config *cc,
 					     struct scatterlist *sg);
 
 static bool crypt_integrity_aead(struct crypt_config *cc);
+
+void print_integrity_metadata(char *msg, char *data)
+{
+	char str[200] = {0};
+	int i;
+
+	if (data != NULL)
+	{
+		for (i = 0; i < 48; i++)
+		{
+			sprintf(str + strlen(str), "%02hhx ", data[i]);
+			//printk("%02hhx ", data[i]);
+		}
+		printk("%s, metadata - %s\n", msg, str);
+	}
+}
 
 /*
  * Use this to access cipher attributes that are independent of the key.
@@ -1164,12 +1180,15 @@ static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
 static int crypt_integrity_ctr(struct crypt_config *cc, struct dm_target *ti)
 {
 #ifdef CONFIG_BLK_DEV_INTEGRITY
+	printk("Disk name is %s\n", cc->dev->bdev->bd_disk->disk_name);
 	struct blk_integrity *bi = blk_get_integrity(cc->dev->bdev->bd_disk);
 	struct mapped_device *md = dm_table_get_md(ti->table);
 
 	/* From now we require underlying device with our integrity profile */
 	if (!bi || strcasecmp(bi->profile->name, "DM-DIF-EXT-TAG")) {
 		ti->error = "Integrity profile not supported.";
+		if (bi)
+			printk("integrity profile is %s\n",bi->profile->name);
 		return -EINVAL;
 	}
 
@@ -1183,9 +1202,13 @@ static int crypt_integrity_ctr(struct crypt_config *cc, struct dm_target *ti)
 		return -EINVAL;
 	}
 
+	printk("cc->integrity_iv_size is %d, blk_integrity %p\n", cc->integrity_iv_size, bi);
+	if (bi)
+		printk("bi profile %s\n", bi->profile->name);
+
 	if (crypt_integrity_aead(cc)) {
 		cc->integrity_tag_size = cc->on_disk_tag_size - cc->integrity_iv_size;
-		DMDEBUG("%s: Integrity AEAD, tag size %u, IV size %u.", dm_device_name(md),
+		printk("%s: Integrity AEAD, tag size %u, IV size %u.", dm_device_name(md),
 		       cc->integrity_tag_size, cc->integrity_iv_size);
 
 		if (crypto_aead_setauthsize(any_tfm_aead(cc), cc->integrity_tag_size)) {
@@ -1193,7 +1216,7 @@ static int crypt_integrity_ctr(struct crypt_config *cc, struct dm_target *ti)
 			return -EINVAL;
 		}
 	} else if (cc->integrity_iv_size)
-		DMDEBUG("%s: Additional per-sector space %u bytes for IV.", dm_device_name(md),
+		printk("%s: Additional per-sector space %u bytes for IV.", dm_device_name(md),
 		       cc->integrity_iv_size);
 
 	if ((cc->integrity_tag_size + cc->integrity_iv_size) != bi->tag_size) {
@@ -1293,6 +1316,9 @@ static int crypt_convert_block_aead(struct crypt_config *cc,
 	u8 *iv, *org_iv, *tag_iv, *tag;
 	__le64 *sector;
 	int r = 0;
+	struct dm_crypt_io *io;
+
+	printk("Num of bytes %d, offset %d,  tag offset %d", bv_in.bv_len, bv_in.bv_offset, tag_offset);
 
 	BUG_ON(cc->integrity_iv_size && cc->integrity_iv_size != cc->iv_size);
 
@@ -1316,11 +1342,17 @@ static int crypt_convert_block_aead(struct crypt_config *cc,
 	tag = tag_from_dmreq(cc, dmreq);
 	tag_iv = iv_tag_from_dmreq(cc, dmreq);
 
+	io = container_of(ctx, struct dm_crypt_io, ctx);
+	//print_integrity_metadata("crypt_convert_block_aead", io->integrity_metadata);
+	//dump_stack();
+	printk("Encrypting from %p, length %d, offset %d", bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
+
 	/* AEAD request:
 	 *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
 	 *  | (authenticated) | (auth+encryption) |              |
 	 *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
 	 */
+
 	sg_init_table(dmreq->sg_in, 4);
 	sg_set_buf(&dmreq->sg_in[0], sector, sizeof(uint64_t));
 	sg_set_buf(&dmreq->sg_in[1], org_iv, cc->iv_size);
@@ -1561,6 +1593,7 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 		atomic_set(&ctx->cc_pending, 1);
 
 	while (ctx->iter_in.bi_size && ctx->iter_out.bi_size) {
+		printk("remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
 
 		r = crypt_alloc_req(cc, ctx);
 		if (r) {
@@ -1666,17 +1699,34 @@ static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size)
 	gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
 	unsigned i, len, remaining_size;
 	struct page *page;
+    struct bio_vec bvec;
+    struct bvec_iter j;
+    int dir = bio_data_dir(io->base_bio);
 
 retry:
 	if (unlikely(gfp_mask & __GFP_DIRECT_RECLAIM))
 		mutex_lock(&cc->bio_alloc_lock);
 
+#if 0
+    /* Do each segment independently. */
+    bio_for_each_segment(bvec, io->base_bio, j) {
+        sector_t sector = j.bi_sector;
+        //char *buffer = kmap_atomic(bvec.bv_page);
+        unsigned long offset = bvec.bv_offset;
+        size_t len = bvec.bv_len;
+
+        /* process mapped buffer */
+        printk("sector %d, len %d, offset %d, dir %d", sector, len, offset, dir);
+    }
+#endif
 	clone = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, io->base_bio->bi_opf,
 				 GFP_NOIO, &cc->bs);
 	clone->bi_private = io;
 	clone->bi_end_io = crypt_endio;
 
 	remaining_size = size;
+
+	printk("nr_iovecs = %d", nr_iovecs);
 
 	for (i = 0; i < nr_iovecs; i++) {
 		page = mempool_alloc(&cc->page_pool, gfp_mask);
@@ -1692,6 +1742,7 @@ retry:
 		bio_add_page(clone, page, len, 0);
 
 		remaining_size -= len;
+		printk("remaining_size = %d, len = %d", remaining_size, len);
 	}
 
 	/* Allocate space for integrity tags */
@@ -1817,6 +1868,7 @@ static void crypt_endio(struct bio *clone)
 	bio_put(clone);
 
 	if (rw == READ && !error) {
+		print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
 		kcryptd_queue_crypt(io);
 		return;
 	}
@@ -1856,6 +1908,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		return 1;
 	}
 
+	print_integrity_metadata("Inside kcryptd_io_read before remap", io->integrity_metadata);
 	dm_submit_bio_remap(io->base_bio, clone);
 	return 0;
 }
@@ -1874,6 +1927,7 @@ static void kcryptd_queue_read(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
 
+	printk("Inside kcryptd_queue_read");
 	INIT_WORK(&io->work, kcryptd_io_read_work);
 	queue_work(cc->io_queue, &io->work);
 }
@@ -2133,6 +2187,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	 * Crypto API backlogged the request, because its queue was full
 	 * and we're in softirq context, so continue from a workqueue
 	 */
+	printk("kcryptd_crypt_read_convert after crypt_convert");
 	if (r == BLK_STS_DEV_RESOURCE) {
 		INIT_WORK(&io->work, kcryptd_crypt_read_continue);
 		queue_work(cc->crypt_queue, &io->work);
@@ -2205,6 +2260,8 @@ static void kcryptd_crypt(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
 
+	print_integrity_metadata("Inside kcryptd_crypt", io->integrity_metadata);
+
 	if (bio_data_dir(io->base_bio) == READ)
 		kcryptd_crypt_read_convert(io);
 	else
@@ -2219,6 +2276,7 @@ static void kcryptd_crypt_tasklet(unsigned long work)
 static void kcryptd_queue_crypt(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
+	print_integrity_metadata("Inside kcryptd_queue_crypt", io->integrity_metadata);
 
 	if ((bio_data_dir(io->base_bio) == READ && test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags)) ||
 	    (bio_data_dir(io->base_bio) == WRITE && test_bit(DM_CRYPT_NO_WRITE_WORKQUEUE, &cc->flags))) {
@@ -2401,13 +2459,16 @@ static int crypt_setkey(struct crypt_config *cc)
 			r = crypto_skcipher_setkey(cc->cipher_tfm.tfms[i],
 						   cc->key + (i * subkey_size),
 						   subkey_size);
-		if (r)
+		if (r){
+			printk("at line number %d in file %s\n", __LINE__, __FILE__);
 			err = r;
+		}
 	}
 
 	if (crypt_integrity_hmac(cc))
 		memzero_explicit(cc->authenc_key, crypt_authenckey_size(cc));
 
+	printk("returning %d from crypt_setkey", err);
 	return err;
 }
 
@@ -2589,13 +2650,19 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 	int r = -EINVAL;
 	int key_string_len = strlen(key);
 
+	printk("key string is %s", key);
+
 	/* Hyphen (which gives a key_size of zero) means there is no key. */
 	if (!cc->key_size && strcmp(key, "-"))
+	{
+		printk("at line number %d in file %s\n", __LINE__, __FILE__);
 		goto out;
+	}
 
 	/* ':' means the key is in kernel keyring, short-circuit normal key processing */
 	if (key[0] == ':') {
 		r = crypt_set_keyring_key(cc, key + 1);
+		printk("at line number %d in file %s\n", __LINE__, __FILE__);
 		goto out;
 	}
 
@@ -2608,7 +2675,10 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 
 	/* Decode key from its hex representation. */
 	if (cc->key_size && hex2bin(cc->key, key, cc->key_size) < 0)
+	{
+		printk("at line number %d in file %s\n", __LINE__, __FILE__);
 		goto out;
+	}
 
 	r = crypt_setkey(cc);
 	if (!r)
@@ -2617,6 +2687,7 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 out:
 	/* Hex key string not needed after here, so wipe it. */
 	memset(key, '0', key_string_len);
+	printk("return value %d", r);
 
 	return r;
 }
@@ -3131,6 +3202,8 @@ static int crypt_ctr_optional(struct dm_target *ti, unsigned int argc, char **ar
 			cc->sector_shift = __ffs(cc->sector_size) - SECTOR_SHIFT;
 		} else if (!strcasecmp(opt_string, "iv_large_sectors"))
 			set_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags);
+		else if (!strcasecmp(opt_string, "store_data_in_integrity_md"))
+			set_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags);
 		else {
 			ti->error = "Invalid feature arguments";
 			return -EINVAL;
@@ -3165,20 +3238,26 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int key_size;
 	unsigned int align_mask;
 	unsigned long long tmpll;
-	int ret;
+	int ret, i;
 	size_t iv_size_padding, additional_req_size;
 	char dummy;
 
+	printk("device name %s, begin %d, len %d\n", devname, ti->begin, ti->len);
 	if (argc < 5) {
 		ti->error = "Not enough arguments";
 		return -EINVAL;
 	}
+
+	for(i = 0; i < argc; i++)
+		printk("[%d] = %s", i, argv[i]);
 
 	key_size = get_key_size(&argv[1]);
 	if (key_size < 0) {
 		ti->error = "Cannot parse key size";
 		return -EINVAL;
 	}
+
+	printk("key size = %d", key_size);
 
 	cc = kzalloc(struct_size(cc, key, key_size), GFP_KERNEL);
 	if (!cc) {
@@ -3212,6 +3291,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 
 	if (crypt_integrity_aead(cc)) {
+		printk("Inside crypt_integrity_aead\n");
 		cc->dmreq_start = sizeof(struct aead_request);
 		cc->dmreq_start += crypto_aead_reqsize(any_tfm_aead(cc));
 		align_mask = crypto_aead_alignmask(any_tfm_aead(cc));
@@ -3221,6 +3301,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		align_mask = crypto_skcipher_alignmask(any_tfm(cc));
 	}
 	cc->dmreq_start = ALIGN(cc->dmreq_start, __alignof__(struct dm_crypt_request));
+	printk("dmreq_start is %d\n", cc->dmreq_start);
 
 	if (align_mask < CRYPTO_MINALIGN) {
 		/* Allocate the padding exactly */
@@ -3234,6 +3315,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		 */
 		iv_size_padding = align_mask;
 	}
+	printk("IV size padding %ld\n", iv_size_padding);
 
 	/*  ...| IV + padding | original IV | original sec. number | bio tag offset | */
 	additional_req_size = sizeof(struct dm_crypt_request) +
@@ -3241,6 +3323,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		cc->iv_size +
 		sizeof(uint64_t) +
 		sizeof(unsigned int);
+	printk("additional_req_size %ld\n", additional_req_size);
 
 	ret = mempool_init_kmalloc_pool(&cc->req_pool, MIN_IOS, cc->dmreq_start + additional_req_size);
 	if (ret) {
@@ -3252,6 +3335,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ALIGN(sizeof(struct dm_crypt_io) + cc->dmreq_start + additional_req_size,
 		      ARCH_KMALLOC_MINALIGN);
 
+	printk("per bio data size = %d\n", cc->per_bio_data_size);
 	ret = mempool_init(&cc->page_pool, BIO_MAX_VECS, crypt_page_alloc, crypt_page_free, cc);
 	if (ret) {
 		ti->error = "Cannot allocate page mempool";
@@ -3280,12 +3364,15 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
+	printk("dev name is %s", cc->dev->name);
+
 	ret = -EINVAL;
 	if (sscanf(argv[4], "%llu%c", &tmpll, &dummy) != 1 || tmpll != (sector_t)tmpll) {
 		ti->error = "Invalid device sector";
 		goto bad;
 	}
 	cc->start = tmpll;
+	printk("start = %d\n", cc->start);
 
 	if (bdev_is_zoned(cc->dev->bdev)) {
 		/*
@@ -3312,6 +3399,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	if (crypt_integrity_aead(cc) || cc->integrity_iv_size) {
+		printk("inside IV check, IV size %d\n", cc->integrity_iv_size);
 		ret = crypt_integrity_ctr(cc, ti);
 		if (ret)
 			goto bad;
@@ -3378,6 +3466,9 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	struct dm_crypt_io *io;
 	struct crypt_config *cc = ti->private;
 
+	printk("\nInside crypt_map, BIO direction %s, total bytes %d, total sectors %d, first sector %d\n",\ 
+			(bio_data_dir(bio) == WRITE) ? "WRITE" : "READ", bio->bi_iter.bi_size, bio_sectors(bio), bio->bi_iter.bi_sector);
+
 	/*
 	 * If bio is REQ_PREFLUSH or REQ_OP_DISCARD, just bypass crypt queues.
 	 * - for REQ_PREFLUSH device-mapper core ensures that no IO is in-flight
@@ -3410,10 +3501,12 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_KILL;
 
 	io = dm_per_bio_data(bio, cc->per_bio_data_size);
+	printk("dm target offset %d, on_disk_tag_size %d\n", dm_target_offset(ti, bio->bi_iter.bi_sector), cc->on_disk_tag_size);
 	crypt_io_init(io, cc, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
 
 	if (cc->on_disk_tag_size) {
 		unsigned tag_len = cc->on_disk_tag_size * (bio_sectors(bio) >> cc->sector_shift);
+		printk("tag len = %d, bio_sectors %d, sector_shift %d", tag_len, bio_sectors(bio), cc->sector_shift);
 
 		if (unlikely(tag_len > KMALLOC_MAX_SIZE) ||
 		    unlikely(!(io->integrity_metadata = kmalloc(tag_len,
@@ -3423,7 +3516,10 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 			io->integrity_metadata = mempool_alloc(&cc->tag_pool, GFP_NOIO);
 			io->integrity_metadata_from_pool = true;
 		}
+		memset(io->integrity_metadata, 0, tag_len);
 	}
+
+	print_integrity_metadata("crypt_map", io->integrity_metadata);
 
 	if (crypt_integrity_aead(cc))
 		io->ctx.r.req_aead = (struct aead_request *)(io + 1);
