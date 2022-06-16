@@ -208,6 +208,8 @@ struct crypt_config {
 	unsigned int integrity_iv_size;
 	unsigned int on_disk_tag_size;
 
+	unsigned int on_disk_pd_size;
+
 	/*
 	 * pool for per bio private data, crypto requests,
 	 * encryption requeusts/buffer pages and integrity tags
@@ -1343,8 +1345,6 @@ static int crypt_convert_block_aead(struct crypt_config *cc,
 	tag_iv = iv_tag_from_dmreq(cc, dmreq);
 
 	io = container_of(ctx, struct dm_crypt_io, ctx);
-	//print_integrity_metadata("crypt_convert_block_aead", io->integrity_metadata);
-	//dump_stack();
 	printk("Encrypting from %p, length %d, offset %d", bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
 
 	/* AEAD request:
@@ -1900,7 +1900,10 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 	crypt_inc_pending(io);
 
-	clone->bi_iter.bi_sector = cc->start + io->sector;
+	clone->bi_iter.bi_sector = cc->start + 
+		test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) ? (SECTOR_SIZE/cc->on_disk_pd_size) * io->sector : io->sector;
+
+	printk("Incoming sector %ld, outgoing sector %ld", io->sector, clone->bi_iter.bi_sector);
 
 	if (dm_crypt_integrity_io_alloc(io, clone)) {
 		crypt_dec_pending(io);
@@ -1908,7 +1911,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		return 1;
 	}
 
-	print_integrity_metadata("Inside kcryptd_io_read before remap", io->integrity_metadata);
 	dm_submit_bio_remap(io->base_bio, clone);
 	return 0;
 }
@@ -2260,8 +2262,6 @@ static void kcryptd_crypt(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
 
-	print_integrity_metadata("Inside kcryptd_crypt", io->integrity_metadata);
-
 	if (bio_data_dir(io->base_bio) == READ)
 		kcryptd_crypt_read_convert(io);
 	else
@@ -2276,7 +2276,6 @@ static void kcryptd_crypt_tasklet(unsigned long work)
 static void kcryptd_queue_crypt(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
-	print_integrity_metadata("Inside kcryptd_queue_crypt", io->integrity_metadata);
 
 	if ((bio_data_dir(io->base_bio) == READ && test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags)) ||
 	    (bio_data_dir(io->base_bio) == WRITE && test_bit(DM_CRYPT_NO_WRITE_WORKQUEUE, &cc->flags))) {
@@ -3202,9 +3201,14 @@ static int crypt_ctr_optional(struct dm_target *ti, unsigned int argc, char **ar
 			cc->sector_shift = __ffs(cc->sector_size) - SECTOR_SHIFT;
 		} else if (!strcasecmp(opt_string, "iv_large_sectors"))
 			set_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags);
-		else if (!strcasecmp(opt_string, "store_data_in_integrity_md"))
+		else if (sscanf(opt_string, "store_data_in_integrity_md:%u", &val) == 1) {
 			set_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags);
-		else {
+                        if (val == 0 || val > MAX_TAG_SIZE) {
+                                ti->error = "Invalid integrity arguments";
+                                return -EINVAL;
+                        }
+                        cc->on_disk_pd_size = val;
+		} else {
 			ti->error = "Invalid feature arguments";
 			return -EINVAL;
 		}
@@ -3518,8 +3522,6 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 		}
 		memset(io->integrity_metadata, 0, tag_len);
 	}
-
-	print_integrity_metadata("crypt_map", io->integrity_metadata);
 
 	if (crypt_integrity_aead(cc))
 		io->ctx.r.req_aead = (struct aead_request *)(io + 1);
