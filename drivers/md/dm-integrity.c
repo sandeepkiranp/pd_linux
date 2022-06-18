@@ -1828,30 +1828,57 @@ again:
 			kfree(checksums);
 	} else {
 		struct bio_integrity_payload *bip = dio->bio_details.bi_integrity;
-
-		if (bip) {
-			struct bio_vec biv;
-			struct bvec_iter iter;
-			unsigned data_to_process = dio->range.n_sectors;
-			sector_to_block(ic, data_to_process);
-			data_to_process *= ic->tag_size;
-
-			bip_for_each_vec(biv, bip, iter) {
-				unsigned char *tag;
-				unsigned this_len;
-
-				BUG_ON(PageHighMem(biv.bv_page));
-				tag = bvec_virt(&biv);
-				this_len = min(biv.bv_len, data_to_process);
-				r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
-							this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
-				if (unlikely(r))
-					goto error;
-				data_to_process -= this_len;
-				if (!data_to_process)
-					break;
+		struct bio *bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
+		if (!bio_flagged(bio,BIO_INTEGRITY_METADATA_ONLY)) {
+			if (bip) {
+				struct bio_vec biv;
+				struct bvec_iter iter;
+				unsigned data_to_process = dio->range.n_sectors;
+				sector_to_block(ic, data_to_process);
+				data_to_process *= ic->tag_size;
+	
+				bip_for_each_vec(biv, bip, iter) {
+					unsigned char *tag;
+					unsigned this_len;
+	
+					BUG_ON(PageHighMem(biv.bv_page));
+					tag = bvec_virt(&biv);
+					this_len = min(biv.bv_len, data_to_process);
+					r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
+								this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
+					if (unlikely(r))
+						goto error;
+					data_to_process -= this_len;
+					if (!data_to_process)
+						break;
+				}
 			}
 		}
+		else {
+                        struct bio_vec biv;
+                        struct bvec_iter iter;
+                        unsigned data_to_process = bio->bi_iter.bi_size;
+
+			bio_set_dev(bio, ic->dev->bdev);
+
+                        bio_for_each_segment(biv, bio, iter) {
+                                unsigned char *tag;
+                                unsigned this_len;
+				printk("data_to_process %d, bv_len %d", data_to_process, biv.bv_len);
+
+                                tag = kmap_atomic(biv.bv_page);
+                                this_len = min(biv.bv_len, data_to_process);
+                                r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
+                                                        this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
+				kunmap_atomic(tag);
+                                if (unlikely(r))
+                                        goto error;
+                                data_to_process -= this_len;
+                                if (!data_to_process)
+                                        break;
+                        }
+		}
+
 	}
 skip_io:
 	dec_in_flight(dio);
@@ -1937,7 +1964,6 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 				wanted_tag_size <<= ic->log2_tag_size;
 			else
 				wanted_tag_size *= ic->tag_size;
-			printk("dm_integrity, sector %d wanted_tag_size %d, bi_size %d\n", dio->range.logical_sector, wanted_tag_size, bip->bip_iter.bi_size);
 			if (unlikely(wanted_tag_size != bip->bip_iter.bi_size)) {
 				DMERR("Invalid integrity data size %u, expected %u",
 				      bip->bip_iter.bi_size, wanted_tag_size);
@@ -1954,12 +1980,21 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	if (unlikely(ic->mode == 'R') && unlikely(dio->op != REQ_OP_READ))
 		return DM_MAPIO_KILL;
 
+
 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
 	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
 	printk("interleave sectors %d, area %ld, offset %ld , metadata block %ld, metadata offset %ld\n", 
 			ic->sb->log2_interleave_sectors, area, offset, dio->metadata_block, dio->metadata_offset);
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
 	printk("Actual sector %d", bio->bi_iter.bi_sector);
+
+	if (bio_flagged(bio,BIO_INTEGRITY_METADATA_ONLY))
+	{
+                INIT_WORK(&dio->work, integrity_metadata);
+                queue_work(ic->metadata_wq, &dio->work);
+
+		return DM_MAPIO_SUBMITTED;
+	}
 
 	dm_integrity_map_continue(dio, true);
 	return DM_MAPIO_SUBMITTED;
@@ -2135,6 +2170,8 @@ static void dm_integrity_map_continue(struct dm_integrity_io *dio, bool from_map
 		queue_work(ic->offload_wq, &dio->work);
 		return;
 	}
+
+	printk("need_sync is %d", need_sync_io);
 
 lock_retry:
 	spin_lock_irq(&ic->endio_wait.lock);

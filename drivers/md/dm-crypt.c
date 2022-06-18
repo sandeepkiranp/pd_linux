@@ -1900,8 +1900,12 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 	crypt_inc_pending(io);
 
-	clone->bi_iter.bi_sector = cc->start + 
-		test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) ? (SECTOR_SIZE/cc->on_disk_pd_size) * io->sector : io->sector;
+	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
+		clone->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_pd_size) * io->sector;
+		bio_set_flag(clone, BIO_INTEGRITY_METADATA_ONLY);
+	}
+	else
+		clone->bi_iter.bi_sector = cc->start + io->sector;
 
 	printk("Incoming sector %ld, outgoing sector %ld", io->sector, clone->bi_iter.bi_sector);
 
