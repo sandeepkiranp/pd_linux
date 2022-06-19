@@ -1159,17 +1159,21 @@ static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
 	unsigned int tag_len;
 	int ret;
 
-	if (!bio_sectors(bio) || !io->cc->on_disk_tag_size)
+	if (!bio_sectors(bio) || !io->cc->on_disk_tag_size || !cc->on_disk_pd_size)
 		return 0;
 
 	bip = bio_integrity_alloc(bio, GFP_NOIO, 1);
 	if (IS_ERR(bip))
 		return PTR_ERR(bip);
 
-	tag_len = io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
+	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &io->cc->flags)) {
+		tag_len = io->cc->on_disk_pd_size * (bio_sectors(bio) >> io->cc->sector_shift);
+	}
+	else
+		tag_len = io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 
 	bip->bip_iter.bi_size = tag_len;
-	bip->bip_iter.bi_sector = io->cc->start + io->sector;
+	bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
 
 	ret = bio_integrity_add_page(bio, virt_to_page(io->integrity_metadata),
 				     tag_len, offset_in_page(io->integrity_metadata));
@@ -1699,26 +1703,11 @@ static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size)
 	gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
 	unsigned i, len, remaining_size;
 	struct page *page;
-    struct bio_vec bvec;
-    struct bvec_iter j;
-    int dir = bio_data_dir(io->base_bio);
 
 retry:
 	if (unlikely(gfp_mask & __GFP_DIRECT_RECLAIM))
 		mutex_lock(&cc->bio_alloc_lock);
 
-#if 0
-    /* Do each segment independently. */
-    bio_for_each_segment(bvec, io->base_bio, j) {
-        sector_t sector = j.bi_sector;
-        //char *buffer = kmap_atomic(bvec.bv_page);
-        unsigned long offset = bvec.bv_offset;
-        size_t len = bvec.bv_len;
-
-        /* process mapped buffer */
-        printk("sector %d, len %d, offset %d, dir %d", sector, len, offset, dir);
-    }
-#endif
 	clone = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, io->base_bio->bi_opf,
 				 GFP_NOIO, &cc->bs);
 	clone->bi_private = io;
@@ -1886,15 +1875,25 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	struct crypt_config *cc = io->cc;
 	struct bio *clone;
 
-	/*
-	 * We need the original biovec array in order to decrypt the whole bio
-	 * data *afterwards* -- thanks to immutable biovecs we don't need to
-	 * worry about the block layer modifying the biovec array; so leverage
-	 * bio_alloc_clone().
-	 */
-	clone = bio_alloc_clone(cc->dev->bdev, io->base_bio, gfp, &cc->bs);
-	if (!clone)
-		return 1;
+        if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
+                clone = crypt_alloc_buffer(io, (io->base_bio->bi_iter.bi_size/cc->on_disk_pd_size) * (SECTOR_SIZE * cc->sector_shift));
+                if (unlikely(!clone)) {
+                        io->error = BLK_STS_IOERR;
+                        return 1;
+                }
+	}
+	else {
+	        /*
+        	 * We need the original biovec array in order to decrypt the whole bio
+	         * data *afterwards* -- thanks to immutable biovecs we don't need to
+        	 * worry about the block layer modifying the biovec array; so leverage
+	         * bio_alloc_clone().
+        	 */
+	        clone = bio_alloc_clone(cc->dev->bdev, io->base_bio, gfp, &cc->bs);
+	        if (!clone)
+        	        return 1;
+	}
+
 	clone->bi_private = io;
 	clone->bi_end_io = crypt_endio;
 
@@ -1902,7 +1901,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		clone->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_pd_size) * io->sector;
-		bio_set_flag(clone, BIO_INTEGRITY_METADATA_ONLY);
 		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY clone %p, original %p flags %d\n", clone, io->base_bio, clone->bi_flags);
 	}
 	else

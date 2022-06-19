@@ -1988,14 +1988,6 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
 	printk("Actual sector %d", bio->bi_iter.bi_sector);
 
-	if (bio_flagged(bio,BIO_INTEGRITY_METADATA_ONLY))
-	{
-                INIT_WORK(&dio->work, integrity_metadata);
-                queue_work(ic->metadata_wq, &dio->work);
-
-		return DM_MAPIO_SUBMITTED;
-	}
-
 	dm_integrity_map_continue(dio, true);
 	return DM_MAPIO_SUBMITTED;
 }
