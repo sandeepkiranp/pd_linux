@@ -1903,6 +1903,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		clone->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_pd_size) * io->sector;
 		bio_set_flag(clone, BIO_INTEGRITY_METADATA_ONLY);
+		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY clone %p, original %p flags %d\n", clone, io->base_bio, clone->bi_flags);
 	}
 	else
 		clone->bi_iter.bi_sector = cc->start + io->sector;
@@ -2463,7 +2464,6 @@ static int crypt_setkey(struct crypt_config *cc)
 						   cc->key + (i * subkey_size),
 						   subkey_size);
 		if (r){
-			printk("at line number %d in file %s\n", __LINE__, __FILE__);
 			err = r;
 		}
 	}
@@ -2471,7 +2471,6 @@ static int crypt_setkey(struct crypt_config *cc)
 	if (crypt_integrity_hmac(cc))
 		memzero_explicit(cc->authenc_key, crypt_authenckey_size(cc));
 
-	printk("returning %d from crypt_setkey", err);
 	return err;
 }
 
@@ -2658,14 +2657,12 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 	/* Hyphen (which gives a key_size of zero) means there is no key. */
 	if (!cc->key_size && strcmp(key, "-"))
 	{
-		printk("at line number %d in file %s\n", __LINE__, __FILE__);
 		goto out;
 	}
 
 	/* ':' means the key is in kernel keyring, short-circuit normal key processing */
 	if (key[0] == ':') {
 		r = crypt_set_keyring_key(cc, key + 1);
-		printk("at line number %d in file %s\n", __LINE__, __FILE__);
 		goto out;
 	}
 
@@ -2679,7 +2676,6 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 	/* Decode key from its hex representation. */
 	if (cc->key_size && hex2bin(cc->key, key, cc->key_size) < 0)
 	{
-		printk("at line number %d in file %s\n", __LINE__, __FILE__);
 		goto out;
 	}
 
@@ -2690,7 +2686,6 @@ static int crypt_set_key(struct crypt_config *cc, char *key)
 out:
 	/* Hex key string not needed after here, so wipe it. */
 	memset(key, '0', key_string_len);
-	printk("return value %d", r);
 
 	return r;
 }
