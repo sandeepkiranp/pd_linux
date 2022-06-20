@@ -208,8 +208,6 @@ struct crypt_config {
 	unsigned int integrity_iv_size;
 	unsigned int on_disk_tag_size;
 
-	unsigned int on_disk_pd_size;
-
 	/*
 	 * pool for per bio private data, crypto requests,
 	 * encryption requeusts/buffer pages and integrity tags
@@ -1159,18 +1157,14 @@ static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
 	unsigned int tag_len;
 	int ret;
 
-	if (!bio_sectors(bio) || !io->cc->on_disk_tag_size || !cc->on_disk_pd_size)
+	if (!bio_sectors(bio) || !io->cc->on_disk_tag_size)
 		return 0;
 
 	bip = bio_integrity_alloc(bio, GFP_NOIO, 1);
 	if (IS_ERR(bip))
 		return PTR_ERR(bip);
 
-	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &io->cc->flags)) {
-		tag_len = io->cc->on_disk_pd_size * (bio_sectors(bio) >> io->cc->sector_shift);
-	}
-	else
-		tag_len = io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
+	tag_len = io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 
 	bip->bip_iter.bi_size = tag_len;
 	bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
@@ -1876,7 +1870,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	struct bio *clone;
 
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-                clone = crypt_alloc_buffer(io, (io->base_bio->bi_iter.bi_size/cc->on_disk_pd_size) * (SECTOR_SIZE * cc->sector_shift));
+                clone = crypt_alloc_buffer(io, (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift));
                 if (unlikely(!clone)) {
                         io->error = BLK_STS_IOERR;
                         return 1;
@@ -1900,8 +1894,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	crypt_inc_pending(io);
 
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		clone->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_pd_size) * io->sector;
-		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY clone %p, original %p flags %d\n", clone, io->base_bio, clone->bi_flags);
+		clone->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
+		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY\n");
 	}
 	else
 		clone->bi_iter.bi_sector = cc->start + io->sector;
@@ -3204,7 +3198,7 @@ static int crypt_ctr_optional(struct dm_target *ti, unsigned int argc, char **ar
                                 ti->error = "Invalid integrity arguments";
                                 return -EINVAL;
                         }
-                        cc->on_disk_pd_size = val;
+                        cc->on_disk_tag_size = val;
 		} else {
 			ti->error = "Invalid feature arguments";
 			return -EINVAL;
@@ -3506,7 +3500,11 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	crypt_io_init(io, cc, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
 
 	if (cc->on_disk_tag_size) {
-		unsigned tag_len = cc->on_disk_tag_size * (bio_sectors(bio) >> cc->sector_shift);
+		unsigned tag_len;
+		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) 
+			tag_len = bio->bi_iter.bi_size;
+		else
+			tag_len = cc->on_disk_tag_size * (bio_sectors(bio) >> cc->sector_shift);
 		printk("tag len = %d, bio_sectors %d, sector_shift %d", tag_len, bio_sectors(bio), cc->sector_shift);
 
 		if (unlikely(tag_len > KMALLOC_MAX_SIZE) ||
