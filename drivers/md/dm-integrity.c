@@ -444,22 +444,22 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 	__u64 ms;
 	unsigned mo;
 
-	printk("Input aread %ld, offset %ld, log2_interleave_sectors %d, log2_buffer_sectors %d, log2_tag_size %d, tag_size %d", 
-			area, offset, ic->sb->log2_interleave_sectors,ic->log2_buffer_sectors, ic->log2_tag_size, ic->tag_size);
-	printk("log2_metadata_run %d, metadata_run %d", ic->log2_metadata_run, ic->metadata_run);
+	//printk("Input aread %ld, offset %ld, log2_interleave_sectors %d, log2_buffer_sectors %d, log2_tag_size %d, tag_size %d", 
+	//		area, offset, ic->sb->log2_interleave_sectors,ic->log2_buffer_sectors, ic->log2_tag_size, ic->tag_size);
+	//printk("log2_metadata_run %d, metadata_run %d", ic->log2_metadata_run, ic->metadata_run);
 
 	ms = area << ic->sb->log2_interleave_sectors;
-	printk("ms %ld line %d", ms,__LINE__);
+	//printk("ms %ld line %d", ms,__LINE__);
 	if (likely(ic->log2_metadata_run >= 0))
 		ms += area << ic->log2_metadata_run;
 	else
 		ms += area * ic->metadata_run;
-	printk("ms %ld line %d", ms,__LINE__);
+	//printk("ms %ld line %d", ms,__LINE__);
 
 	ms >>= ic->log2_buffer_sectors;
 
 	sector_to_block(ic, offset);
-	printk("ms %ld, offset %ld", ms, offset);
+	//printk("ms %ld, offset %ld", ms, offset);
 
 	if (likely(ic->log2_tag_size >= 0)) {
 		ms += offset >> (SECTOR_SHIFT + ic->log2_buffer_sectors - ic->log2_tag_size);
@@ -468,7 +468,7 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 		ms += (__u64)offset * ic->tag_size >> (SECTOR_SHIFT + ic->log2_buffer_sectors);
 		mo = (offset * ic->tag_size) & ((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - 1);
 	}
-	printk("ms %ld, mo %ld", ms, mo);
+	//printk("ms %ld, mo %ld", ms, mo);
 	*metadata_offset = mo;
 	return ms;
 }
@@ -1442,7 +1442,7 @@ static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, se
 			return PTR_ERR(data);
 
 		to_copy = min((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - *metadata_offset, total_size);
-		printk("dm_integrity_rw_tag reading metadata block %d, offset %d, to_copy %d, total %d\n", *metadata_block,*metadata_offset, to_copy, total_size);
+		//printk("dm_integrity_rw_tag reading metadata block %d, offset %d, to_copy %d, total %d\n", *metadata_block,*metadata_offset, to_copy, total_size);
 		dp = data + *metadata_offset;
 		if (op == TAG_READ) {
 			memcpy(tag, dp, to_copy);
@@ -1828,8 +1828,6 @@ again:
 			kfree(checksums);
 	} else {
 		struct bio_integrity_payload *bip = dio->bio_details.bi_integrity;
-		struct bio *bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
-		if (!bio_flagged(bio,BIO_INTEGRITY_METADATA_ONLY)) {
 			if (bip) {
 				struct bio_vec biv;
 				struct bvec_iter iter;
@@ -1853,32 +1851,6 @@ again:
 						break;
 				}
 			}
-		}
-		else {
-                        struct bio_vec biv;
-                        struct bvec_iter iter;
-                        unsigned data_to_process = bio->bi_iter.bi_size;
-
-			bio_set_dev(bio, ic->dev->bdev);
-
-                        bio_for_each_segment(biv, bio, iter) {
-                                unsigned char *tag;
-                                unsigned this_len;
-				printk("data_to_process %d, bv_len %d", data_to_process, biv.bv_len);
-
-                                tag = kmap_atomic(biv.bv_page);
-                                this_len = min(biv.bv_len, data_to_process);
-                                r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
-                                                        this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
-				kunmap_atomic(tag);
-                                if (unlikely(r))
-                                        goto error;
-                                data_to_process -= this_len;
-                                if (!data_to_process)
-                                        break;
-                        }
-		}
-
 	}
 skip_io:
 	dec_in_flight(dio);
@@ -1983,10 +1955,10 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 
 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
 	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
-	printk("interleave sectors %d, area %ld, offset %ld , metadata block %ld, metadata offset %ld\n", 
-			ic->sb->log2_interleave_sectors, area, offset, dio->metadata_block, dio->metadata_offset);
+	//printk("interleave sectors %d, area %ld, offset %ld , metadata block %ld, metadata offset %ld\n", 
+	//		ic->sb->log2_interleave_sectors, area, offset, dio->metadata_block, dio->metadata_offset);
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
-	printk("Actual sector %d", bio->bi_iter.bi_sector);
+	//printk("Actual sector %d", bio->bi_iter.bi_sector);
 
 	dm_integrity_map_continue(dio, true);
 	return DM_MAPIO_SUBMITTED;
@@ -2163,7 +2135,7 @@ static void dm_integrity_map_continue(struct dm_integrity_io *dio, bool from_map
 		return;
 	}
 
-	printk("need_sync is %d", need_sync_io);
+	//printk("need_sync is %d", need_sync_io);
 
 lock_retry:
 	spin_lock_irq(&ic->endio_wait.lock);
@@ -3465,8 +3437,8 @@ static int calculate_device_limits(struct dm_integrity_c *ic)
 
 		get_area_and_offset(ic, ic->provided_data_sectors - 1, &last_area, &last_offset);
 		last_sector = get_data_sector(ic, last_area, last_offset);
-		printk("metadata_run %d, log2_metadata_run %d, provided_data_sectors %d, last_sector %d, last area %d, last offset %d, ic->start %d, meta_device_sectors %d\n", 
-				ic->metadata_run, ic->log2_metadata_run , ic->provided_data_sectors, last_sector, last_area, last_offset, ic->start, ic->meta_device_sectors);
+		//printk("metadata_run %d, log2_metadata_run %d, provided_data_sectors %d, last_sector %d, last area %d, last offset %d, ic->start %d, meta_device_sectors %d\n", 
+				//ic->metadata_run, ic->log2_metadata_run , ic->provided_data_sectors, last_sector, last_area, last_offset, ic->start, ic->meta_device_sectors);
 		if (last_sector < ic->start || last_sector >= ic->meta_device_sectors)
 			return -EINVAL;
 	} else {

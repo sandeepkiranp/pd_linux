@@ -1427,7 +1427,6 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 	/* Reject unexpected unaligned bio. */
 	if (unlikely(bv_in.bv_len & (cc->sector_size - 1)))
 		return -EIO;
-
 	dmreq = dmreq_of_req(cc, req);
 	dmreq->iv_sector = ctx->cc_sector;
 	if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
@@ -1481,7 +1480,6 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 
 	if (!r && cc->iv_gen_ops && cc->iv_gen_ops->post)
 		r = cc->iv_gen_ops->post(cc, org_iv, dmreq);
-
 	bio_advance_iter(ctx->bio_in, &ctx->iter_in, cc->sector_size);
 	bio_advance_iter(ctx->bio_out, &ctx->iter_out, cc->sector_size);
 
@@ -1709,7 +1707,7 @@ retry:
 
 	remaining_size = size;
 
-	printk("nr_iovecs = %d", nr_iovecs);
+	printk("crypt_alloc_buffer nr_iovecs = %d, size = %d", nr_iovecs, size);
 
 	for (i = 0; i < nr_iovecs; i++) {
 		page = mempool_alloc(&cc->page_pool, gfp_mask);
@@ -1725,7 +1723,6 @@ retry:
 		bio_add_page(clone, page, len, 0);
 
 		remaining_size -= len;
-		printk("remaining_size = %d, len = %d", remaining_size, len);
 	}
 
 	/* Allocate space for integrity tags */
@@ -1848,13 +1845,32 @@ static void crypt_endio(struct bio *clone)
 		crypt_free_buffer_pages(cc, clone);
 
 	error = clone->bi_status;
-	bio_put(clone);
 
 	if (rw == READ && !error) {
+		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
+			// copy intergrity metadata to clone's memory pages
+			struct bvec_iter iter_out = io->base_bio->bi_iter;
+			unsigned offset = 0;
+			while (iter_out.bi_size) {	
+				printk("Inside crypt_endio, read %d\n", iter_out.bi_size);
+       				struct bio_vec bv_out = bio_iter_iovec(io->base_bio, iter_out);
+				char *buffer = kmap_atomic(bv_out.bv_page);
+
+				memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, cc->sector_size);
+		        	bio_advance_iter(io->base_bio, &iter_out, cc->sector_size);
+				offset += cc->sector_size;
+				kunmap_atomic(buffer);
+			}
+			crypt_free_buffer_pages(cc, clone);
+		}
+		bio_put(clone);
 		print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
+		printk("Original bio size %d\n", io->base_bio->bi_iter.bi_size);
 		kcryptd_queue_crypt(io);
 		return;
 	}
+
+	bio_put(clone);
 
 	if (unlikely(error))
 		io->error = error;
@@ -2186,7 +2202,6 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	 * Crypto API backlogged the request, because its queue was full
 	 * and we're in softirq context, so continue from a workqueue
 	 */
-	printk("kcryptd_crypt_read_convert after crypt_convert");
 	if (r == BLK_STS_DEV_RESOURCE) {
 		INIT_WORK(&io->work, kcryptd_crypt_read_continue);
 		queue_work(cc->crypt_queue, &io->work);
@@ -3461,7 +3476,8 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	struct dm_crypt_io *io;
 	struct crypt_config *cc = ti->private;
 
-	printk("\nInside crypt_map, BIO direction %s, total bytes %d, total sectors %d, first sector %d\n",\ 
+	printk("\nInside crypt_map, %s BIO direction %s, total bytes %d, total sectors %d, first sector %d\n",\ 
+			(test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))? "PD Device" : "", \
 			(bio_data_dir(bio) == WRITE) ? "WRITE" : "READ", bio->bi_iter.bi_size, bio_sectors(bio), bio->bi_iter.bi_sector);
 
 	/*
