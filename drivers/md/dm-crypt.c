@@ -1459,18 +1459,22 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 
 	if (cc->iv_gen_ops) {
 		/* For READs use IV stored in integrity metadata */
-		if (cc->integrity_iv_size && bio_data_dir(ctx->bio_in) != WRITE) {
+		if ((cc->integrity_iv_size || cc->flags == PD_READ_DURING_WRITE) && bio_data_dir(ctx->bio_in) != WRITE) {
 			memcpy(org_iv, tag_iv, cc->integrity_iv_size);
 		} else {
-			r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
-			if (r < 0)
-				return r;
-			/* Data can be already preprocessed in generator */
-			if (test_bit(CRYPT_ENCRYPT_PREPROCESS, &cc->cipher_flags))
-				sg_in = sg_out;
-			/* Store generated IV in integrity metadata */
-			if (cc->integrity_iv_size)
-				memcpy(tag_iv, org_iv, cc->integrity_iv_size);
+			//for PD writes, IV is already in metadata by this time
+			if (cc->flags != PD_READ_DURING_WRITE) {
+				//TODO: for PD, orig_iv below should be appended with offset for unique IV  
+				r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
+				if (r < 0)
+					return r;
+				/* Data can be already preprocessed in generator */
+				if (test_bit(CRYPT_ENCRYPT_PREPROCESS, &cc->cipher_flags))
+					sg_in = sg_out;
+				/* Store generated IV in integrity metadata */
+				if (cc->integrity_iv_size)
+					memcpy(tag_iv, org_iv, cc->integrity_iv_size);
+			}
 		}
 		/* Working copy of IV, to be modified in crypto API */
 		memcpy(iv, org_iv, cc->iv_size);
@@ -1485,6 +1489,7 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 
 	if (!r && cc->iv_gen_ops && cc->iv_gen_ops->post)
 		r = cc->iv_gen_ops->post(cc, org_iv, dmreq);
+	//TODO: encrypt each IV block for PD and not the entire sector_size
 /*
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		advance_by = cc->integrity_tag_size;
@@ -1854,7 +1859,7 @@ static void crypt_endio(struct bio *clone)
 	 * free the processed pages
 	 */
 	if (rw == WRITE)
-		crypt_free_buffer_pages(cc, clone);
+		crypt_free_buffer_pages(cc, clone); //TODO: check if we need to free this here for PD
 
 	error = clone->bi_status;
 
@@ -1866,7 +1871,7 @@ static void crypt_endio(struct bio *clone)
 				io->base_bio = clone;
 			}
 			else {
-				// copy intergrity metadata to clone's memory pages
+				// copy intergrity metadata to base bio's memory pages
 				struct bvec_iter iter_out = io->base_bio->bi_iter;
 				unsigned offset = 0;
 				while (iter_out.bi_size) {	
@@ -2174,7 +2179,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 * 2. copy the above encrypted input to integ m/d from #1
 	 * 3. write all the sectors with integ md after encryption
 	 */
-	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
+	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags != PD_READ_DURING_WRITE) {
 		io->flags = PD_READ_DURING_WRITE;
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP)) {
 			printk("kcryptd_io_read failed !");
