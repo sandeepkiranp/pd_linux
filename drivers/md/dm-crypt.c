@@ -144,7 +144,7 @@ enum cipher_flags {
 	CRYPT_ENCRYPT_PREPROCESS,	/* Must preprocess data for encryption (elephant) */
 };
 enum io_flags {
-	PD_READ_DURING_WRITE
+	PD_READ_DURING_WRITE = 1
 };
 /*
  * The fields in here must be read only after initialization.
@@ -1869,6 +1869,9 @@ static void crypt_endio(struct bio *clone)
 				// save the base bio for future and work on clone
 				io->write_bio = io->base_bio;
 				io->base_bio = clone;
+				io->write_sector = io->sector;
+				io->sector = clone->bi_iter.bi_sector;
+				io->write_ctx_bio = io->ctx.bio_out;
 			}
 			else {
 				// copy intergrity metadata to base bio's memory pages
@@ -1909,7 +1912,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
                 clone = crypt_alloc_buffer(io, (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift));
-		clone->bi_opf = REQ_OP_READ;
+		if (io->flags == PD_READ_DURING_WRITE)
+			clone->bi_opf = REQ_OP_READ;
                 if (unlikely(!clone)) {
                         io->error = BLK_STS_IOERR;
                         return 1;
@@ -2252,11 +2256,11 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags == PD_READ_DURING_WRITE)) {
 	    // copy data from io->ctx.bio_out to integrity_metadata
-            struct bvec_iter iter_out = io->ctx.bio_out->bi_iter;
+            struct bvec_iter iter_out = io->write_ctx_bio->bi_iter;
             unsigned offset = 0;
             while (iter_out.bi_size) {
-                printk("Inside crypt_endio, read %d\n", iter_out.bi_size);
-                struct bio_vec bv_out = bio_iter_iovec(io->ctx.bio_out, iter_out);
+                printk("Inside kcryptd_crypt_read_convert, read %d\n", iter_out.bi_size);
+                struct bio_vec bv_out = bio_iter_iovec(io->write_ctx_bio, iter_out);
                 char *buffer = kmap_atomic(bv_out.bv_page);
 
                 memcpy(io->integrity_metadata + offset, buffer + bv_out.bv_offset, cc->sector_size);
@@ -2264,9 +2268,16 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->sector_size;
                 kunmap_atomic(buffer);
             }
+	    //free the original write ctx buffer
+	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
+	    bio_put(io->write_ctx_bio);
+	    crypt_dec_pending(io);
 
 	    // write the whole thing
+	    io->base_bio->bi_opf = = REQ_OP_WRITE;
 	    kcryptd_crypt_write_convert(io);
+
+	    crypt_free_buffer_pages(cc, io->base_bio);
 	}
 }
 
