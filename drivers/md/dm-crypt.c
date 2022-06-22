@@ -2183,11 +2183,12 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 * 2. copy the above encrypted input to integ m/d from #1
 	 * 3. write all the sectors with integ md after encryption
 	 */
-	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags != PD_READ_DURING_WRITE) {
+	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags != PD_READ_DURING_WRITE) {
 		io->flags = PD_READ_DURING_WRITE;
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP)) {
 			printk("kcryptd_io_read failed !");
 		}
+		crypt_dec_pending(io);
 		return;
 	}
 
@@ -2271,13 +2272,13 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
 	    bio_put(io->write_ctx_bio);
-	    crypt_dec_pending(io);
 
 	    // write the whole thing
 	    io->base_bio->bi_opf = = REQ_OP_WRITE;
 	    kcryptd_crypt_write_convert(io);
 
 	    crypt_free_buffer_pages(cc, io->base_bio);
+	    crypt_dec_pending(io);
 	}
 }
 
