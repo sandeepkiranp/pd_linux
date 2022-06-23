@@ -71,6 +71,7 @@ struct dm_crypt_io {
 	struct crypt_config *cc;
 	struct bio *base_bio;
 	struct bio *write_bio;
+	struct bio *write_ctx_bio;
 	u8 *integrity_metadata;
 	bool integrity_metadata_from_pool;
 	struct work_struct work;
@@ -81,6 +82,7 @@ struct dm_crypt_io {
 	atomic_t io_pending;
 	blk_status_t error;
 	sector_t sector;
+	sector_t write_sector;
 
 	struct rb_node rb_node;
 	unsigned long flags;
@@ -1908,16 +1910,36 @@ static void crypt_endio(struct bio *clone)
 static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 {
 	struct crypt_config *cc = io->cc;
-	struct bio *clone;
+	struct bio *clone = NULL, *bio = NULL, *prev = NULL;;
 
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-                clone = crypt_alloc_buffer(io, (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift));
-		if (io->flags == PD_READ_DURING_WRITE)
-			clone->bi_opf = REQ_OP_READ;
-                if (unlikely(!clone)) {
-                        io->error = BLK_STS_IOERR;
-                        return 1;
-                }
+		unsigned size = (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift);
+		unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		unsigned rem_iovecs = nr_iovecs;
+		while(rem_iovecs > 0) {
+			unsigned assigned = min_t(unsigned, rem_iovecs, BIO_MAX_VECS);
+			printk("kcryptd_io_read nr_iovecs %d, rem_iovecs %d, assigned iovecs %d", nr_iovecs, rem_iovecs, assigned);
+                	bio = crypt_alloc_buffer(io, assigned * PAGE_SIZE);
+                	if (unlikely(!bio)) {
+                       		io->error = BLK_STS_IOERR;
+                        	return 1;
+                	}
+			if (io->flags == PD_READ_DURING_WRITE)
+				bio->bi_opf = REQ_OP_READ;
+			if(!prev) {
+				bio->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
+			}
+			else {
+				bio_chain(bio, prev);
+				dm_submit_bio_remap(io->base_bio, prev);
+				bio->bi_private = NULL;
+				bio->bi_end_io = NULL;
+				bio->bi_iter.bi_sector = bio_end_sector(prev);
+			}
+			rem_iovecs -= assigned;
+			prev = bio;
+		}
+		clone = bio;
 	}
 	else {
 	        /*
@@ -1940,16 +1962,16 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		clone->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
 		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY\n");
 	}
-	else
+	else {
 		clone->bi_iter.bi_sector = cc->start + io->sector;
 
-	printk("Incoming sector %ld, outgoing sector %ld", io->sector, clone->bi_iter.bi_sector);
-
-	if (dm_crypt_integrity_io_alloc(io, clone)) {
-		crypt_dec_pending(io);
-		bio_put(clone);
-		return 1;
+		if (dm_crypt_integrity_io_alloc(io, clone)) {
+			crypt_dec_pending(io);
+			bio_put(clone);
+			return 1;
+		}
 	}
+	printk("Incoming sector %ld, outgoing sector %ld", io->sector, clone->bi_iter.bi_sector);
 
 	dm_submit_bio_remap(io->base_bio, clone);
 	return 0;
@@ -2144,16 +2166,21 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 * Prevent io from disappearing until this function completes.
 	 */
 	crypt_inc_pending(io);
-	crypt_convert_init(cc, ctx, NULL, io->base_bio, sector);
-
-	clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
-	if (unlikely(!clone)) {
-		io->error = BLK_STS_IOERR;
-		goto dec;
+	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags == PD_READ_DURING_WRITE) {
+		crypt_convert_init(cc, ctx, io->base_bio, io->base_bio, sector);
 	}
+	else {
+		crypt_convert_init(cc, ctx, NULL, io->base_bio, sector);
 
-	io->ctx.bio_out = clone;
-	io->ctx.iter_out = clone->bi_iter;
+		clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
+		if (unlikely(!clone)) {
+			io->error = BLK_STS_IOERR;
+			goto dec;
+		}
+
+		io->ctx.bio_out = clone;
+		io->ctx.iter_out = clone->bi_iter;
+	}
 
 	sector += bio_sectors(clone);
 
@@ -2274,10 +2301,9 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	    bio_put(io->write_ctx_bio);
 
 	    // write the whole thing
-	    io->base_bio->bi_opf = = REQ_OP_WRITE;
+	    io->base_bio->bi_opf = REQ_OP_WRITE;
 	    kcryptd_crypt_write_convert(io);
 
-	    crypt_free_buffer_pages(cc, io->base_bio);
 	    crypt_dec_pending(io);
 	}
 }
