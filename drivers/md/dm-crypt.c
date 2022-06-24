@@ -1926,6 +1926,18 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
                 	}
 			if (io->flags == PD_READ_DURING_WRITE)
 				bio->bi_opf = REQ_OP_READ;
+
+			struct bio_integrity_payload *bip = bio_integrity(bio);
+                        struct bio_vec biv;
+                        struct bvec_iter iter;
+
+                        bip_for_each_vec(biv, bip, iter) {
+                                unsigned char *tag;
+
+                                tag = bvec_virt(&biv);
+				biv.bv_page = virt_to_page(tag + xxxxxxxxxxx);
+                        }
+
 			if(!prev) {
 				bio->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
 			}
