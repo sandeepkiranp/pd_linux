@@ -2177,10 +2177,12 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 * Prevent io from disappearing until this function completes.
 	 */
 	crypt_inc_pending(io);
+	/*
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags == PD_READ_DURING_WRITE) {
 		crypt_convert_init(cc, ctx, io->base_bio, io->base_bio, io->base_bio->bi_iter.bi_sector);
 	}
-	else {
+	else */ {
+	
 		crypt_convert_init(cc, ctx, NULL, io->base_bio, sector);
 
 		clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
@@ -2216,7 +2218,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		wait_for_completion(&ctx->restart);
 		crypt_finished = 1;
 	}
-
+#if 0
 	printk("kcryptd_crypt_write_convert, finished encrypting input\n");
 	/*
 	 * 1. read equivalent sectors for integrity metadata. This should result in decrypted data with integ m/d
@@ -2235,8 +2237,9 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags == PD_READ_DURING_WRITE) {
 		printk("restoring base_bio\n");
                 io->base_bio = io->write_bio;
+		io->ctx.bio_out = io->base_bio;
         }
-
+#endif
 	/* Encryption was already finished, submit io now */
 	if (crypt_finished) {
 		kcryptd_crypt_write_io_submit(io, 0);
@@ -3489,6 +3492,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	printk("dev name is %s", cc->dev->name);
+	printk("Disk name is %s\n", cc->dev->bdev->bd_disk->disk_name);
 
 	ret = -EINVAL;
 	if (sscanf(argv[4], "%llu%c", &tmpll, &dummy) != 1 || tmpll != (sector_t)tmpll) {

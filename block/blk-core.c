@@ -766,6 +766,9 @@ void submit_bio_noacct_nocheck(struct bio *bio)
  * systems and other upper level users of the block layer should use
  * submit_bio() instead.
  */
+#define PRINTK(x,y,z) \
+	if (!strcmp(bio->bi_bdev->bd_disk->disk_name, "dm-0"))\
+		printk(x,y,z);
 void submit_bio_noacct(struct bio *bio)
 {
 	struct block_device *bdev = bio->bi_bdev;
@@ -773,11 +776,14 @@ void submit_bio_noacct(struct bio *bio)
 	blk_status_t status = BLK_STS_IOERR;
 	struct blk_plug *plug;
 
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
+
 	might_sleep();
 
 	plug = blk_mq_plug(q, bio);
 	if (plug && plug->nowait)
 		bio->bi_opf |= REQ_NOWAIT;
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 
 	/*
 	 * For a REQ_NOWAIT based request, return -EOPNOTSUPP
@@ -796,6 +802,7 @@ void submit_bio_noacct(struct bio *bio)
 		if (bdev->bd_partno && unlikely(blk_partition_remap(bio)))
 			goto end_io;
 	}
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 
 	/*
 	 * Filter flush bio's early so that bio based drivers without flush
@@ -809,10 +816,12 @@ void submit_bio_noacct(struct bio *bio)
 			goto end_io;
 		}
 	}
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 
 	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
 		bio_clear_polled(bio);
 
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 	switch (bio_op(bio)) {
 	case REQ_OP_DISCARD:
 		if (!bdev_max_discard_sectors(bdev))
@@ -845,13 +854,16 @@ void submit_bio_noacct(struct bio *bio)
 	default:
 		break;
 	}
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 
 	if (blk_throtl_bio(bio))
 		return;
 
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 	blk_cgroup_bio_start(bio);
 	blkcg_bio_issue_init(bio);
 
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 	if (!bio_flagged(bio, BIO_TRACE_COMPLETION)) {
 		trace_block_bio_queue(bio);
 		/* Now that enqueuing has been traced, we need to trace
@@ -859,7 +871,9 @@ void submit_bio_noacct(struct bio *bio)
 		 */
 		bio_set_flag(bio, BIO_TRACE_COMPLETION);
 	}
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 	submit_bio_noacct_nocheck(bio);
+	PRINTK("In function %s, line %d\n", __func__, __LINE__);
 	return;
 
 not_supported:
