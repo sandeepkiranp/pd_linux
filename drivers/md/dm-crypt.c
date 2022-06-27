@@ -1879,6 +1879,17 @@ static void crypt_endio(struct bio *clone)
 				io->write_ctx_bio = io->ctx.bio_out;
 			}
 			else {
+			        struct page *page;
+        			struct bio_vec *bvec;
+        			struct bvec_iter_all iter_all;
+				int count = 0;
+
+        			bio_for_each_segment_all(bvec, clone, iter_all) {
+                			page = bvec->bv_page;
+					count++;
+				}
+				printk("Total read pages %d\n", count);
+
 				// copy intergrity metadata to base bio's memory pages
 				struct bvec_iter iter_out = io->base_bio->bi_iter;
 				unsigned offset = 0;
@@ -1913,28 +1924,24 @@ static void crypt_endio(struct bio *clone)
 static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 {
 	struct crypt_config *cc = io->cc;
-	struct bio *clone = NULL, *bio = NULL, *prev = NULL;;
+	struct bio *clone = NULL, *bio = NULL, *prev = NULL;
 	bool chained_bio = false;
-
 
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		unsigned size = (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift);
 		unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		unsigned rem_iovecs = nr_iovecs;
-		unsigned tag_idx = 0;
 		while(rem_iovecs > 0) {
 			unsigned assigned = min_t(unsigned, rem_iovecs, BIO_MAX_VECS);
-			printk("kcryptd_io_read nr_iovecs %d, rem_iovecs %d, assigned iovecs %d, tag_idx %d", nr_iovecs, rem_iovecs, assigned, tag_idx);
+			printk("kcryptd_io_read total size %d, nr_iovecs %d, rem_iovecs %d, assigned iovecs %d", size, nr_iovecs, rem_iovecs, assigned);
                 	bio = crypt_alloc_buffer(io, assigned * PAGE_SIZE);
                 	if (unlikely(!bio)) {
                        		io->error = BLK_STS_IOERR;
                         	return 1;
                 	}
-			if (io->flags == PD_READ_DURING_WRITE)
-				bio->bi_opf = REQ_OP_READ;
-			printk("crypt_alloc_buffer passed\n");
-				bio->bi_private = NULL;
-				bio->bi_end_io = NULL;
+			bio->bi_opf = REQ_OP_READ;
+			bio->bi_private = NULL;
+			bio->bi_end_io = NULL;
 
 			if(!prev) {
 				bio->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
@@ -1948,7 +1955,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			printk("chaining bio and submitting previous bio -COMPLETED, bio sector %d\n", bio->bi_iter.bi_sector);
 			rem_iovecs -= assigned;
 			prev = bio;
-			tag_idx += io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 		}
 		clone = bio;
 	}
@@ -1963,8 +1969,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	        if (!clone)
         	        return 1;
 	}
-		clone->bi_private = io;
-		clone->bi_end_io = crypt_endio;
+	clone->bi_private = io;
+	clone->bi_end_io = crypt_endio;
 
 	crypt_inc_pending(io);
 
@@ -2177,11 +2183,11 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 * Prevent io from disappearing until this function completes.
 	 */
 	crypt_inc_pending(io);
-	/*
+/*	
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags == PD_READ_DURING_WRITE) {
 		crypt_convert_init(cc, ctx, io->base_bio, io->base_bio, io->base_bio->bi_iter.bi_sector);
 	}
-	else */ {
+	else */{
 	
 		crypt_convert_init(cc, ctx, NULL, io->base_bio, sector);
 
@@ -2218,8 +2224,8 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		wait_for_completion(&ctx->restart);
 		crypt_finished = 1;
 	}
-#if 0
 	printk("kcryptd_crypt_write_convert, finished encrypting input\n");
+#if 0
 	/*
 	 * 1. read equivalent sectors for integrity metadata. This should result in decrypted data with integ m/d
 	 * 2. copy the above encrypted input to integ m/d from #1

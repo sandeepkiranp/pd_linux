@@ -338,7 +338,7 @@ struct bitmap_block_status {
 static struct kmem_cache *journal_io_cache;
 
 #define JOURNAL_IO_MEMPOOL	32
-#define DEBUG_PRINT
+
 #ifdef DEBUG_PRINT
 #define DEBUG_print(x, ...)	printk(KERN_DEBUG x, ##__VA_ARGS__)
 static void __DEBUG_bytes(__u8 *bytes, size_t len, const char *msg, ...)
@@ -444,22 +444,14 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 	__u64 ms;
 	unsigned mo;
 
-	//printk("Input aread %ld, offset %ld, log2_interleave_sectors %d, log2_buffer_sectors %d, log2_tag_size %d, tag_size %d", 
-	//		area, offset, ic->sb->log2_interleave_sectors,ic->log2_buffer_sectors, ic->log2_tag_size, ic->tag_size);
-	//printk("log2_metadata_run %d, metadata_run %d", ic->log2_metadata_run, ic->metadata_run);
-
 	ms = area << ic->sb->log2_interleave_sectors;
-	//printk("ms %ld line %d", ms,__LINE__);
 	if (likely(ic->log2_metadata_run >= 0))
 		ms += area << ic->log2_metadata_run;
 	else
 		ms += area * ic->metadata_run;
-	//printk("ms %ld line %d", ms,__LINE__);
-
 	ms >>= ic->log2_buffer_sectors;
 
 	sector_to_block(ic, offset);
-	//printk("ms %ld, offset %ld", ms, offset);
 
 	if (likely(ic->log2_tag_size >= 0)) {
 		ms += offset >> (SECTOR_SHIFT + ic->log2_buffer_sectors - ic->log2_tag_size);
@@ -468,7 +460,6 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 		ms += (__u64)offset * ic->tag_size >> (SECTOR_SHIFT + ic->log2_buffer_sectors);
 		mo = (offset * ic->tag_size) & ((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - 1);
 	}
-	//printk("ms %ld, mo %ld", ms, mo);
 	*metadata_offset = mo;
 	return ms;
 }
@@ -1436,13 +1427,11 @@ static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, se
 		if (unlikely(r))
 			return r;
 
-
 		data = dm_bufio_read(ic->bufio, *metadata_block, &b);
 		if (IS_ERR(data))
 			return PTR_ERR(data);
 
 		to_copy = min((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - *metadata_offset, total_size);
-		//printk("dm_integrity_rw_tag reading metadata block %d, offset %d, to_copy %d, total %d\n", *metadata_block,*metadata_offset, to_copy, total_size);
 		dp = data + *metadata_offset;
 		if (op == TAG_READ) {
 			memcpy(tag, dp, to_copy);
@@ -1828,29 +1817,30 @@ again:
 			kfree(checksums);
 	} else {
 		struct bio_integrity_payload *bip = dio->bio_details.bi_integrity;
-			if (bip) {
-				struct bio_vec biv;
-				struct bvec_iter iter;
-				unsigned data_to_process = dio->range.n_sectors;
-				sector_to_block(ic, data_to_process);
-				data_to_process *= ic->tag_size;
-	
-				bip_for_each_vec(biv, bip, iter) {
-					unsigned char *tag;
-					unsigned this_len;
-	
-					BUG_ON(PageHighMem(biv.bv_page));
-					tag = bvec_virt(&biv);
-					this_len = min(biv.bv_len, data_to_process);
-					r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
-								this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
-					if (unlikely(r))
-						goto error;
-					data_to_process -= this_len;
-					if (!data_to_process)
-						break;
-				}
+
+		if (bip) {
+			struct bio_vec biv;
+			struct bvec_iter iter;
+			unsigned data_to_process = dio->range.n_sectors;
+			sector_to_block(ic, data_to_process);
+			data_to_process *= ic->tag_size;
+
+			bip_for_each_vec(biv, bip, iter) {
+				unsigned char *tag;
+				unsigned this_len;
+
+				BUG_ON(PageHighMem(biv.bv_page));
+				tag = bvec_virt(&biv);
+				this_len = min(biv.bv_len, data_to_process);
+				r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
+							this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
+				if (unlikely(r))
+					goto error;
+				data_to_process -= this_len;
+				if (!data_to_process)
+					break;
 			}
+		}
 	}
 skip_io:
 	dec_in_flight(dio);
@@ -1866,11 +1856,7 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	struct dm_integrity_io *dio = dm_per_bio_data(bio, sizeof(struct dm_integrity_io));
 	struct bio_integrity_payload *bip;
 
-
 	sector_t area, offset;
-
-	//dump_stack();
-	printk("Inside dm_integrity_map starting sector %d, num of sectors %d, size %d\n", bio->bi_iter.bi_sector, bio_sectors(bio), bio->bi_iter.bi_size); 
 
 	dio->ic = ic;
 	dio->bi_status = 0;
@@ -1952,13 +1938,9 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	if (unlikely(ic->mode == 'R') && unlikely(dio->op != REQ_OP_READ))
 		return DM_MAPIO_KILL;
 
-
 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
 	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
-	//printk("interleave sectors %d, area %ld, offset %ld , metadata block %ld, metadata offset %ld\n", 
-	//		ic->sb->log2_interleave_sectors, area, offset, dio->metadata_block, dio->metadata_offset);
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
-	//printk("Actual sector %d", bio->bi_iter.bi_sector);
 
 	dm_integrity_map_continue(dio, true);
 	return DM_MAPIO_SUBMITTED;
@@ -2134,8 +2116,6 @@ static void dm_integrity_map_continue(struct dm_integrity_io *dio, bool from_map
 		queue_work(ic->offload_wq, &dio->work);
 		return;
 	}
-
-	//printk("need_sync is %d", need_sync_io);
 
 lock_retry:
 	spin_lock_irq(&ic->endio_wait.lock);
@@ -3437,8 +3417,6 @@ static int calculate_device_limits(struct dm_integrity_c *ic)
 
 		get_area_and_offset(ic, ic->provided_data_sectors - 1, &last_area, &last_offset);
 		last_sector = get_data_sector(ic, last_area, last_offset);
-		//printk("metadata_run %d, log2_metadata_run %d, provided_data_sectors %d, last_sector %d, last area %d, last offset %d, ic->start %d, meta_device_sectors %d\n", 
-				//ic->metadata_run, ic->log2_metadata_run , ic->provided_data_sectors, last_sector, last_area, last_offset, ic->start, ic->meta_device_sectors);
 		if (last_sector < ic->start || last_sector >= ic->meta_device_sectors)
 			return -EINVAL;
 	} else {
@@ -3988,7 +3966,6 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	char dummy;
 	int r;
 	unsigned extra_args;
-	const char *devname = dm_table_device_name(ti->table);
 	struct dm_arg_set as;
 	static const struct dm_arg _args[] = {
 		{0, 18, "Invalid number of feature args"},
@@ -4001,13 +3978,8 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	__s8 log2_blocks_per_bitmap_bit;
 	__u64 bits_in_journal;
 	__u64 n_bitmap_bits;
-	int i;
 
 #define DIRECT_ARGUMENTS	4
-	printk("device name %s, begin %d, len %d\n", devname, ti->begin, ti->len);
-        for(i = 0; i < argc; i++)
-                printk("[%d] = %s", i, argv[i]);
-
 
 	if (argc <= DIRECT_ARGUMENTS) {
 		ti->error = "Invalid argument count";
@@ -4055,8 +4027,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	if (!strcmp(argv[3], "J") || !strcmp(argv[3], "B") ||
 	    !strcmp(argv[3], "D") || !strcmp(argv[3], "R")) {
-		//ic->mode = argv[3][0];
-		ic->mode = 'D';
+		ic->mode = argv[3][0];
 	} else {
 		ti->error = "Invalid mode (expecting J, B, D, R)";
 		r = -EINVAL;
@@ -4126,7 +4097,6 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 			}
 			ic->bitmap_flush_interval = msecs_to_jiffies(val);
 		} else if (!strncmp(opt_string, "internal_hash:", strlen("internal_hash:"))) {
-			continue;
 			r = get_alg_and_key(opt_string, &ic->internal_hash_alg, &ti->error,
 					    "Invalid internal_hash argument");
 			if (r)
