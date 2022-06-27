@@ -1157,7 +1157,7 @@ static struct scatterlist *crypt_get_sg_data(struct crypt_config *cc,
 	return sg;
 }
 
-static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
+static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int offset)
 {
 	struct bio_integrity_payload *bip;
 	unsigned int tag_len;
@@ -1175,8 +1175,8 @@ static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
 	bip->bip_iter.bi_size = tag_len;
 	bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
 
-	ret = bio_integrity_add_page(bio, virt_to_page(io->integrity_metadata),
-				     tag_len, offset_in_page(io->integrity_metadata));
+	ret = bio_integrity_add_page(bio, virt_to_page(io->integrity_metadata + offset),
+				     tag_len, offset_in_page(io->integrity_metadata + offset));
 	if (unlikely(ret != tag_len))
 		return -ENOMEM;
 
@@ -1706,7 +1706,7 @@ static void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
  * non-blocking allocations without a mutex first but on failure we fallback
  * to blocking allocations with a mutex.
  */
-static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size)
+static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size, int integ_offset)
 {
 	struct crypt_config *cc = io->cc;
 	struct bio *clone;
@@ -1745,7 +1745,7 @@ retry:
 	}
 
 	/* Allocate space for integrity tags */
-	if (dm_crypt_integrity_io_alloc(io, clone)) {
+	if (dm_crypt_integrity_io_alloc(io, clone, integ_offset)) {
 		crypt_free_buffer_pages(cc, clone);
 		bio_put(clone);
 		clone = NULL;
@@ -1931,10 +1931,11 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		unsigned size = (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift);
 		unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		unsigned rem_iovecs = nr_iovecs;
+		int tag_idx = 0;
 		while(rem_iovecs > 0) {
 			unsigned assigned = min_t(unsigned, rem_iovecs, BIO_MAX_VECS);
-			printk("kcryptd_io_read total size %d, nr_iovecs %d, rem_iovecs %d, assigned iovecs %d", size, nr_iovecs, rem_iovecs, assigned);
-                	bio = crypt_alloc_buffer(io, assigned * PAGE_SIZE);
+			printk("kcryptd_io_read total size %d, nr_iovecs %d, rem_iovecs %d, assigned iovecs %d, tag_idx %d", size, nr_iovecs, rem_iovecs, assigned, tag_idx);
+                	bio = crypt_alloc_buffer(io, assigned * PAGE_SIZE, tag_idx);
                 	if (unlikely(!bio)) {
                        		io->error = BLK_STS_IOERR;
                         	return 1;
@@ -1955,6 +1956,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			printk("chaining bio and submitting previous bio -COMPLETED, bio sector %d\n", bio->bi_iter.bi_sector);
 			rem_iovecs -= assigned;
 			prev = bio;
+			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 		}
 		clone = bio;
 	}
@@ -1980,7 +1982,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	else {
 		clone->bi_iter.bi_sector = cc->start + io->sector;
 
-		if (dm_crypt_integrity_io_alloc(io, clone)) {
+		if (dm_crypt_integrity_io_alloc(io, clone, 0)) {
 			crypt_dec_pending(io);
 			bio_put(clone);
 			return 1;
@@ -2191,7 +2193,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	
 		crypt_convert_init(cc, ctx, NULL, io->base_bio, sector);
 
-		clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
+		clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size, 0);
 		if (unlikely(!clone)) {
 			io->error = BLK_STS_IOERR;
 			goto dec;
