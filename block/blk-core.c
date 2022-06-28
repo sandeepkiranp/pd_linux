@@ -766,9 +766,13 @@ void submit_bio_noacct_nocheck(struct bio *bio)
  * systems and other upper level users of the block layer should use
  * submit_bio() instead.
  */
+
+#define PRINTK(x,y,z)    
+/*
 #define PRINTK(x,y,z) \
 	if (!strcmp(bio->bi_bdev->bd_disk->disk_name, "dm-0"))\
 		printk(x,y,z);
+*/
 void submit_bio_noacct(struct bio *bio)
 {
 	struct block_device *bdev = bio->bi_bdev;

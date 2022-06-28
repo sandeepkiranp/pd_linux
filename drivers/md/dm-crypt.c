@@ -1941,24 +1941,24 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
                         	return 1;
                 	}
 			bio->bi_opf = REQ_OP_READ;
-			bio->bi_private = NULL;
-			bio->bi_end_io = NULL;
+			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 
-			if(!prev) {
+			if(!clone) {
 				bio->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
+				clone = bio;
 			}
 			else {
-				printk("chaining bio and submitting previous bio\n");
-				bio->bi_iter.bi_sector = bio_end_sector(prev);
-				bio_chain(prev, bio);
-				dm_submit_bio_remap(io->base_bio, prev);
+				/* add pages of the new bio to clone and free the bio*/
+	        		struct bio_vec *bv;
+			        struct bvec_iter_all iter_all;
+
+			        bio_for_each_segment_all(bv, bio, iter_all) {
+					bio_add_page(clone, bv->bv_page, bv->bv_len, bv->bv_offset);
+        			}	
+				bio_put(bio);
 			}
-			printk("chaining bio and submitting previous bio -COMPLETED, bio sector %d\n", bio->bi_iter.bi_sector);
 			rem_iovecs -= assigned;
-			prev = bio;
-			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 		}
-		clone = bio;
 	}
 	else {
 	        /*
@@ -1988,7 +1988,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			return 1;
 		}
 	}
-	printk("Incoming sector %ld, outgoing sector %ld", io->sector, clone->bi_iter.bi_sector);
+	printk("Incoming sector %ld, incomign size %d, outgoing sector %ld, outgoing size %d", 
+			io->sector, io->base_bio->bi_iter.bi_size, clone->bi_iter.bi_sector, clone->bi_iter.bi_size);
 
 	dm_submit_bio_remap(io->base_bio, clone);
 	return 0;
