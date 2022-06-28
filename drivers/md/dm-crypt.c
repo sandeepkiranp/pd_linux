@@ -1714,6 +1714,7 @@ static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size, int
 	gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
 	unsigned i, len, remaining_size;
 	struct page *page;
+	int ret = 0;
 
 retry:
 	if (unlikely(gfp_mask & __GFP_DIRECT_RECLAIM))
@@ -1739,7 +1740,8 @@ retry:
 
 		len = (remaining_size > PAGE_SIZE) ? PAGE_SIZE : remaining_size;
 
-		bio_add_page(clone, page, len, 0);
+		ret = bio_add_page(clone, page, len, 0);
+		//printk("crypt_alloc_buffer bio_add_page returned %d, vcount = %d, max_vec_count = %d", ret, clone->bi_vcnt, clone->bi_max_vecs);
 
 		remaining_size -= len;
 	}
@@ -1753,6 +1755,7 @@ retry:
 
 	if (unlikely(gfp_mask & __GFP_DIRECT_RECLAIM))
 		mutex_unlock(&cc->bio_alloc_lock);
+
 
 	return clone;
 }
@@ -1951,13 +1954,16 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				/* add pages of the new bio to clone and free the bio*/
 	        		struct bio_vec *bv;
 			        struct bvec_iter_all iter_all;
+				int ret = 0;
 
 			        bio_for_each_segment_all(bv, bio, iter_all) {
-					bio_add_page(clone, bv->bv_page, bv->bv_len, bv->bv_offset);
+					ret = bio_add_page(clone, bv->bv_page, bv->bv_len, bv->bv_offset);
+					//printk("clone vcnt %d, max_vecs %d\n", clone->bi_vcnt, clone->bi_max_vecs);
         			}	
 				bio_put(bio);
 			}
 			rem_iovecs -= assigned;
+			printk("clone size now is %d\n", clone->bi_iter.bi_size);
 		}
 	}
 	else {
