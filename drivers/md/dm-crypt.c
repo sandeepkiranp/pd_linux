@@ -1890,24 +1890,18 @@ static void crypt_endio(struct bio *clone)
 	if (rw == READ && !error) {
 		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 			if (io->flags == PD_READ_DURING_WRITE) {
-				// save the base bio for future and work on clone
+				// save the base bio for future and work on clone and other pages
 				io->write_bio = io->base_bio;
 				io->base_bio = clone;
 				io->write_sector = io->sector;
 				io->sector = clone->bi_iter.bi_sector;
 				io->write_ctx_bio = io->ctx.bio_out;
 			}
-			else {
+			else { // Only READ
 			        struct page *page;
         			struct bio_vec *bvec;
         			struct bvec_iter_all iter_all;
 				int count = 0;
-
-        			bio_for_each_segment_all(bvec, clone, iter_all) {
-                			page = bvec->bv_page;
-					count++;
-				}
-				printk("Total read pages %d\n", count);
 
 				// copy intergrity metadata to base bio's memory pages
 				struct bvec_iter iter_out = io->base_bio->bi_iter;
@@ -1921,7 +1915,8 @@ static void crypt_endio(struct bio *clone)
 		        		bio_advance_iter(io->base_bio, &iter_out, cc->sector_size);
 					offset += cc->sector_size;
 					kunmap_atomic(buffer);
-				}	
+				}
+				// Free clone. All the remaining pages are freed in crypt_dec_pending
 				crypt_free_buffer_pages(cc, clone);
 				bio_put(clone);
 			}
@@ -2357,6 +2352,28 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	}
 	if (r)
 		io->error = r;
+
+	/* call crypt_convert for all the remaining pages. We want to do this only for READ_DURING_WRITE and not for READ alone */
+	if (io->flags == PD_READ_DURING_WRITE) {
+		struct io_bio_vec *temp = io->pages_head;
+		while(temp) {
+			struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_READ, GFP_NOIO, &cc->bs);
+			int count = BIO_MAX_VECS;
+
+			while(count) {
+				bio_add_page(bio, temp->bv.bv_page, temp->bv.bv_len, temp->bv.bv_offset); 
+				temp = temp->next;
+				count--;
+			}
+			crypt_convert_init(cc, &io->ctx, bio, bio, io->sector);
+	
+       			r = crypt_convert(cc, &io->ctx,
+                	          test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+	        	if (r)	
+        	        	io->error = r; //TODO: free everything and return failure
+			bio_put(bio);
+		}	
+	}
 
 	if (atomic_dec_and_test(&io->ctx.cc_pending))
 		kcryptd_crypt_read_done(io);
@@ -3521,7 +3538,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		      ARCH_KMALLOC_MINALIGN);
 
 	printk("per bio data size = %d\n", cc->per_bio_data_size);
-	ret = mempool_init(&cc->page_pool, BIO_MAX_VECS, crypt_page_alloc, crypt_page_free, cc);
+	ret = mempool_init(&cc->page_pool, 2000, crypt_page_alloc, crypt_page_free, cc);
 	if (ret) {
 		ti->error = "Cannot allocate page mempool";
 		goto bad;
