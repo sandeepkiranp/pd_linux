@@ -63,6 +63,10 @@ struct convert_context {
 	} r;
 
 };
+struct io_bio_vec {
+	struct bio_vec bv;
+	struct io_bio_vec *next;
+};
 
 /*
  * per bio private data
@@ -86,6 +90,8 @@ struct dm_crypt_io {
 
 	struct rb_node rb_node;
 	unsigned long flags;
+	struct io_bio_vec *pages_head;
+	struct io_bio_vec *pages_tail;
 } CRYPTO_MINALIGN_ATTR;
 
 struct dm_crypt_request {
@@ -1809,6 +1815,16 @@ static void crypt_dec_pending(struct dm_crypt_io *io)
 		return;
 
 	printk("crypt_dec_pending freeing stuff");
+	if (io->pages_head) {
+		struct io_bio_vec *temp = io->pages_head;
+		struct io_bio_vec *prev = NULL;
+		while(temp) {
+			mempool_free(temp->bv.bv_page, &cc->page_pool);
+			prev = temp;
+			temp = temp->next;
+			kfree(prev);
+		}
+	}
 	if (io->ctx.r.req)
 		crypt_free_req(cc, io->ctx.r.req, base_bio);
 
@@ -1924,17 +1940,37 @@ static void crypt_endio(struct bio *clone)
 
 #define CRYPT_MAP_READ_GFP GFP_NOWAIT
 
+static void io_add_bio_vec(struct dm_crypt_io *io, struct bio_vec *bv)
+{
+	struct io_bio_vec *temp = kmalloc(sizeof(struct io_bio_vec), GFP_KERNEL);
+
+	temp->bv.bv_page = bv->bv_page;
+	temp->bv.bv_len = bv->bv_len;
+	temp->bv.bv_offset = bv->bv_offset;
+	temp->next = NULL;
+
+	if (!io->pages_head) {
+		io->pages_head = io->pages_tail = temp;
+		return;
+	}
+
+	io->pages_tail->next = temp;
+	io->pages_tail = temp;
+}
+
 static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 {
 	struct crypt_config *cc = io->cc;
 	struct bio *clone = NULL, *bio = NULL, *prev = NULL;
 	bool chained_bio = false;
 
+	io->pages_head = io->pages_tail = NULL;
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		unsigned size = (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift);
 		unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		unsigned rem_iovecs = nr_iovecs;
 		int tag_idx = 0;
+		int page_count = 0;
 		while(rem_iovecs > 0) {
 			unsigned assigned = min_t(unsigned, rem_iovecs, BIO_MAX_VECS);
 			printk("kcryptd_io_read total size %d, nr_iovecs %d, rem_iovecs %d, assigned iovecs %d, tag_idx %d", size, nr_iovecs, rem_iovecs, assigned, tag_idx);
@@ -1944,27 +1980,34 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
                         	return 1;
                 	}
 			bio->bi_opf = REQ_OP_READ;
-			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
+			bio->bi_private = NULL;
+			bio->bi_end_io = NULL;
 
-			if(!clone) {
+			if(!prev) {
 				bio->bi_iter.bi_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
-				clone = bio;
 			}
 			else {
-				/* add pages of the new bio to clone and free the bio*/
+				/* add pages of the new bio to io and submit the prev bio */
 	        		struct bio_vec *bv;
 			        struct bvec_iter_all iter_all;
-				int ret = 0;
 
-			        bio_for_each_segment_all(bv, bio, iter_all) {
-					ret = bio_add_page(clone, bv->bv_page, bv->bv_len, bv->bv_offset);
-					//printk("clone vcnt %d, max_vecs %d\n", clone->bi_vcnt, clone->bi_max_vecs);
-        			}	
-				bio_put(bio);
+			        bio_for_each_segment_all(bv, prev, iter_all) {
+					io_add_bio_vec(io, bv);
+					page_count++;
+        			}
+
+				printk("chaining bio and submitting previous bio\n");
+				bio->bi_iter.bi_sector = bio_end_sector(prev);
+				bio_chain(prev, bio);
+				dm_submit_bio_remap(io->base_bio, prev);
 			}
+			printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio sector %d\n", bio->bi_iter.bi_sector);
 			rem_iovecs -= assigned;
-			printk("clone size now is %d\n", clone->bi_iter.bi_size);
+			prev = bio;
+			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 		}
+		clone = bio;
+		printk("kcryptd_io_read page count %d\n", page_count);
 	}
 	else {
 	        /*
