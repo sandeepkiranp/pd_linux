@@ -56,7 +56,7 @@ struct convert_context {
 	struct bvec_iter iter_in;
 	struct bvec_iter iter_out;
 	u64 cc_sector;
-	unsigned int tag_offset;
+	unsigned int *tag_offset;
 	atomic_t cc_pending;
 	union {
 		struct skcipher_request *req;
@@ -1624,7 +1624,7 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 
 	while (ctx->iter_in.bi_size && ctx->iter_out.bi_size) {
 		printk("tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
-				tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+				*tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
 
 		r = crypt_alloc_req(cc, ctx);
 		if (r) {
