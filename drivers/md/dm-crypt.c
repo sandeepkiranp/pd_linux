@@ -1808,7 +1808,9 @@ static void crypt_io_init(struct dm_crypt_io *io, struct crypt_config *cc,
 	io->base_bio = bio;
 	io->sector = sector;
 	io->error = 0;
+	io->flags = 0;
 	io->ctx.r.req = NULL;
+	io->pages_head = io->pages_tail = NULL;
 	io->integrity_metadata = NULL;
 	io->integrity_metadata_from_pool = false;
 	atomic_set(&io->io_pending, 0);
@@ -1906,8 +1908,8 @@ static void crypt_endio(struct bio *clone)
 	unsigned rw = bio_data_dir(clone);
 	blk_status_t error;
 
-	printk("Inside crypt_endio IO address %p, size= %d, starting sector = %d, direction %s\n", 
-			io, clone->bi_iter.bi_size, clone->bi_iter.bi_sector, (rw == WRITE) ? "WRITE" : "READ");
+	printk("Inside crypt_endio IO address %p, IO flags %d, size= %d, starting sector = %d, direction %s\n", 
+			io, io->flags, clone->bi_iter.bi_size, clone->bi_iter.bi_sector, (rw == WRITE) ? "WRITE" : "READ");
 	/*
 	 * free the processed pages
 	 */
@@ -1924,13 +1926,6 @@ static void crypt_endio(struct bio *clone)
 		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 			if (io->flags == PD_READ_DURING_WRITE) {
 				printk("crypt_endio Inside PD_READ_DURING_WRITE\n");
-				
-				crypt_free_buffer_pages(cc, clone); 
-				bio_put(clone);
-                                kcryptd_crypt_write_io_submit(io, 0);
-                                crypt_dec_pending(io);
-                                return;
-				
 				// save the base bio for future and work on clone and other pages
 				io->write_bio = io->base_bio;
 				io->base_bio = clone;
@@ -2398,6 +2393,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags != PD_READ_DURING_WRITE) {
 		printk("PD initiating READ during WRITE\n");
 		io->flags = PD_READ_DURING_WRITE;
+
 		kcryptd_queue_read(io);
 		crypt_dec_pending(io);
 		return;
@@ -3799,8 +3795,8 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	struct dm_crypt_io *io;
 	struct crypt_config *cc = ti->private;
 
-	printk("\nInside crypt_map, %s BIO direction %s, total bytes %d, total sectors %d, first sector %d\n",\ 
-			(test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))? "PD Device" : "", \
+	printk("\nInside crypt_map, Bio address %p, %s BIO direction %s, total bytes %d, total sectors %d, first sector %d\n",\ 
+			bio, (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))? "PD Device" : "", \
 			(bio_data_dir(bio) == WRITE) ? "WRITE" : "READ", bio->bi_iter.bi_size, bio_sectors(bio), bio->bi_iter.bi_sector);
 
 	/*
