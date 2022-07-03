@@ -1871,6 +1871,7 @@ static  void io_free_pages(struct dm_crypt_io *io) {
         if (io->pages_head) {
                 struct io_bio_vec *temp = io->pages_head;
                 struct io_bio_vec *prev = NULL;
+		struct crypt_config *cc = io->cc;
                 while(temp) {
                         mempool_free(temp->bv.bv_page, &cc->page_pool);
                         prev = temp;
