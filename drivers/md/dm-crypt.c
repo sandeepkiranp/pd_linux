@@ -272,6 +272,36 @@ void print_integrity_metadata(char *msg, char *data)
 	}
 }
 
+void print_binary_data(char *msg, char *data, int len)
+{
+	char *str = kmalloc(3 * len + 1, GFP_KERNEL);
+	int i;
+
+	memset(data, 0, 3 * len + 1);
+        if (data != NULL)
+        {
+                for (i = 0; i < len; i++)
+                {
+                        sprintf(str + strlen(str), "%02hhx ", data[i]);
+                }
+                printk("%s - Binary data %s\n", msg, str);
+        }
+	kfree(str);
+}
+
+void print_bio(char *msg, struct bio *bio)
+{
+            struct bvec_iter iter_out = bio->bi_iter;
+            printk("print_bio, size %d, starting sector %d, num of sectors %d\n", iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+            while (iter_out.bi_size) {
+                struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+                char *buffer = page_to_virt(bv_out.bv_page);
+
+		//print_binary_data(msg, buffer + bv_out.bv_offset, 512);
+                bio_advance_iter(bio, &iter_out, 512);
+            }
+}
+
 /*
  * Use this to access cipher attributes that are independent of the key.
  */
@@ -1479,9 +1509,9 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 	if (cc->iv_gen_ops) {
 		/* For READs use IV stored in integrity metadata */
 		if ((cc->integrity_iv_size || cc->flags == PD_READ_DURING_WRITE) && bio_data_dir(ctx->bio_in) != WRITE) {
-			memcpy(org_iv, tag_iv, cc->integrity_iv_size);
+			memcpy(org_iv, tag_iv, cc->integrity_iv_size ? cc->integrity_iv_size : cc->on_disk_tag_size);
 		} else {
-			//for PD writes, IV is already in metadata by this time
+			//for public writes, IV is already in metadata by this time
 			if (io->flags != PD_READ_DURING_WRITE) {
 				//TODO: for PD, orig_iv below should be appended with offset (or randomness per Radu) for unique IV  
 				r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
@@ -1494,6 +1524,11 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 				if (cc->integrity_iv_size)
 					memcpy(tag_iv, org_iv, cc->integrity_iv_size);
 			}
+			else {
+				//Public write. Take IV from integrity metadata
+				memcpy(org_iv, tag_iv, cc->on_disk_tag_size);
+			}
+
 		}
 		/* Working copy of IV, to be modified in crypto API */
 		memcpy(iv, org_iv, cc->iv_size);
@@ -1950,6 +1985,8 @@ static void crypt_endio(struct bio *clone)
 					kunmap_atomic(buffer);
 				}
 				printk("Inside crypt_endio, after read %d, actual bio size %d\n", iter_out.bi_size, io->base_bio->bi_iter.bi_size);
+				print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
+				//print_bio("Inside crypt_endio", clone);
 				// Free clone and all the pages. We dont need them anymore
 				crypt_free_buffer_pages(cc, clone);
 				bio_put(clone);
@@ -2002,7 +2039,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		unsigned rem_iovecs = nr_iovecs;
 		int tag_idx = 0;
-		int page_count = 0;
 		while(rem_iovecs > 0) {
 			unsigned assigned = min_t(unsigned, rem_iovecs, BIO_MAX_VECS);
 			printk("kcryptd_io_read total size %d, nr_iovecs %d, rem_iovecs %d, assigned iovecs %d, tag_idx %d", size, nr_iovecs, rem_iovecs, assigned, tag_idx);
@@ -2017,19 +2053,22 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 			if(!prev) {
 				bio->bi_iter.bi_sector = io->read_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
+	                        struct bio_integrity_payload *bip = bio_integrity(bio);
+        	                bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
 			}
 			else {
 				/* add pages of the new bio to io and submit the prev bio */
 	        		struct bio_vec *bv;
 			        struct bvec_iter_all iter_all;
+	                        struct bio_integrity_payload *bip = bio_integrity(bio);
 
 			        bio_for_each_segment_all(bv, prev, iter_all) {
 					io_add_bio_vec(io, bv);
-					page_count++;
         			}
 
 				printk("chaining bio and submitting previous bio\n");
 				bio->bi_iter.bi_sector = bio_end_sector(prev);
+        	                bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
 				bio_chain(prev, bio);
 				dm_submit_bio_remap(io->base_bio, prev);
 			}
@@ -2039,7 +2078,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 		}
 		clone = bio;
-		printk("kcryptd_io_read page count %d\n", page_count);
 	}
 	else {
 	        /*
@@ -2511,6 +2549,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->sector_size;
 		printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
+	    print_integrity_metadata("kcryptd_crypt_read_convert", io->integrity_metadata);
 
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
