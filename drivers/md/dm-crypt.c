@@ -277,7 +277,7 @@ void print_binary_data(char *msg, char *data, int len)
 	char *str = kmalloc(3 * len + 1, GFP_KERNEL);
 	int i;
 
-	memset(data, 0, 3 * len + 1);
+	memset(str, 0, 3 * len + 1);
         if (data != NULL)
         {
                 for (i = 0; i < len; i++)
@@ -2031,8 +2031,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	struct bio *clone = NULL, *bio = NULL, *prev = NULL;
 	bool chained_bio = false;
 
-	printk("Inside kcryptd_io_read IO address %p\n", io);
-
 	io->pages_head = io->pages_tail = NULL;
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		unsigned size = (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift);
@@ -2047,20 +2045,17 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
                        		io->error = BLK_STS_IOERR;
                         	return 1;
                 	}
-			bio->bi_opf = REQ_OP_READ;
+			bio->bi_opf |= REQ_OP_READ;
 			bio->bi_private = NULL;
 			bio->bi_end_io = NULL;
 
 			if(!prev) {
 				bio->bi_iter.bi_sector = io->read_sector = cc->start + (SECTOR_SIZE/cc->on_disk_tag_size) * io->sector;
-	                        struct bio_integrity_payload *bip = bio_integrity(bio);
-        	                bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
 			}
 			else {
 				/* add pages of the new bio to io and submit the prev bio */
 	        		struct bio_vec *bv;
 			        struct bvec_iter_all iter_all;
-	                        struct bio_integrity_payload *bip = bio_integrity(bio);
 
 			        bio_for_each_segment_all(bv, prev, iter_all) {
 					io_add_bio_vec(io, bv);
@@ -2068,7 +2063,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 				printk("chaining bio and submitting previous bio\n");
 				bio->bi_iter.bi_sector = bio_end_sector(prev);
-        	                bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
 				bio_chain(prev, bio);
 				dm_submit_bio_remap(io->base_bio, prev);
 			}
@@ -2150,6 +2144,7 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 			bio->bi_iter.bi_sector = sector;
 		        bio->bi_private = NULL;
 		        bio->bi_end_io = NULL;
+			bio->bi_opf = REQ_OP_WRITE | REQ_INTEGRITY;
 
 		        /* Allocate space for integrity tags */
 		        if (dm_crypt_integrity_io_alloc(io, bio, tag_idx)) {
@@ -2375,7 +2370,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         bio_put(bio);
                 }
 		struct bvec_iter iter = io->base_bio->bi_iter;
-		bio_reset(io->base_bio, cc->dev->bdev, REQ_OP_WRITE);
+		bio_reset(io->base_bio, cc->dev->bdev, REQ_OP_WRITE|REQ_INTEGRITY);
 		io->base_bio->bi_iter = iter;
 	        io->base_bio->bi_private = io;
 	        io->base_bio->bi_end_io = crypt_endio;
