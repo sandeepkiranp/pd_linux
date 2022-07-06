@@ -296,8 +296,8 @@ void print_bio(char *msg, struct bio *bio)
             while (iter_out.bi_size) {
                 struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                 char *buffer = page_to_virt(bv_out.bv_page);
-
-		//print_binary_data(msg, buffer + bv_out.bv_offset, 512);
+		printk("print_bio bv offset %d, bv len %d\n", bv_out.bv_offset, bv_out.bv_len);
+		print_binary_data(msg, buffer + bv_out.bv_offset, 512);
                 bio_advance_iter(bio, &iter_out, 512);
             }
 }
@@ -1534,6 +1534,8 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 		memcpy(iv, org_iv, cc->iv_size);
 	}
 
+	print_binary_data("crypt_convert_block_skcipher IV", iv, cc->iv_size);
+
 	skcipher_request_set_crypt(req, sg_in, sg_out, cc->sector_size, iv);
 
 	if (bio_data_dir(ctx->bio_in) == WRITE)
@@ -1963,7 +1965,7 @@ static void crypt_endio(struct bio *clone)
 				io->write_sector = io->sector;
 				io->sector = io->read_sector;
 				io->write_ctx_bio = io->ctx.bio_out;
-				printk("Base bio %p, write_ctx_bio %p, write_bio %p\n", io->base_bio, io->write_ctx_bio, io->write_bio); 
+				print_integrity_metadata("Inside crypt_endio, PD_READ_DURING_WRITE integrity ", io->integrity_metadata);
 			}
 			else { // Only READ
 			        struct page *page;
@@ -2045,7 +2047,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
                        		io->error = BLK_STS_IOERR;
                         	return 1;
                 	}
-			bio->bi_opf |= REQ_OP_READ;
+			bio->bi_opf = REQ_INTEGRITY | REQ_OP_READ;
 			bio->bi_private = NULL;
 			bio->bi_end_io = NULL;
 
@@ -2090,7 +2092,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	crypt_inc_pending(io);
 
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY\n");
+		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY, bio integ payload is %p\n", bio_integrity(clone));
 	}
 	else {
 		clone->bi_iter.bi_sector = cc->start + io->sector;
@@ -2336,6 +2338,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	sector_t sector = io->sector;
 	blk_status_t r;
 	unsigned int tag_offset = 0;
+	unsigned int tag_idx = 0;
 
 	printk("kcryptd_crypt_write_convert, IO address %p, encrypting %d bytes from sector %d, sector %d, base bio %p\n", 
 			io, io->base_bio->bi_iter.bi_size, io->base_bio->bi_iter.bi_sector, sector, io->base_bio);
@@ -2350,7 +2353,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
         if (io->flags == PD_READ_DURING_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
-                        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_READ, GFP_NOIO, &cc->bs);
+                        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
                         int count = BIO_MAX_VECS;
 
 			bio->bi_opf = REQ_OP_WRITE;
@@ -2367,6 +2370,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         if (r)
                                 io->error = r; //TODO: free everything and return failure
                         sector += bio_sectors(bio);
+			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
                         bio_put(bio);
                 }
 		struct bvec_iter iter = io->base_bio->bi_iter;
@@ -2374,6 +2378,11 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		io->base_bio->bi_iter = iter;
 	        io->base_bio->bi_private = io;
 	        io->base_bio->bi_end_io = crypt_endio;
+                /* Allocate space for integrity tags */
+                if (dm_crypt_integrity_io_alloc(io, io->base_bio, tag_idx)) {
+                         printk("kcryptd_crypt_write_convert dm_crypt_integrity_io_alloc failed!\n");
+                         //TODO: handle this gracefully
+                }
 		crypt_convert_init(cc, ctx, io->base_bio, io->base_bio, sector, &tag_offset);
 		clone = io->base_bio;
 	}
@@ -2409,13 +2418,14 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	if (r)
 		io->error = r;
 	crypt_finished = atomic_dec_and_test(&ctx->cc_pending);
-	printk("kcryptd_crypt_write_convert, finished encrypting input, finished = %d\n", crypt_finished);
+	printk("kcryptd_crypt_write_convert, finished encrypting input, finished = %d, integrity metadata payload %p\n", crypt_finished, bio_integrity(io->base_bio));
 	if (!crypt_finished && kcryptd_crypt_write_inline(cc, ctx)) {
 		/* Wait for completion signaled by kcryptd_async_done() */
 		wait_for_completion(&ctx->restart);
 		crypt_finished = 1;
 	}
-	
+
+	//print_bio("kcryptd_crypt_write_convert", io->ctx.bio_out);
 	/*
 	 * 1. read equivalent sectors for integrity metadata. This should result in decrypted data with integ m/d
 	 * 2. copy the above encrypted input to integ m/d from #1
