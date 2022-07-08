@@ -153,9 +153,10 @@ enum cipher_flags {
 	CRYPT_IV_LARGE_SECTORS,		/* Calculate IV from sector_size, not 512B sectors */
 	CRYPT_ENCRYPT_PREPROCESS,	/* Must preprocess data for encryption (elephant) */
 };
-enum io_flags {
-	PD_READ_DURING_WRITE = 1,
-};
+
+#define	PD_READ_DURING_WRITE 0x01
+#define PD_HIDDEN_OPERATION  0x02
+
 /*
  * The fields in here must be read only after initialization.
  */
@@ -1290,7 +1291,7 @@ static void crypt_convert_init(struct crypt_config *cc,
 		ctx->iter_out = bio_out->bi_iter;
 	ctx->cc_sector = sector + cc->iv_offset;
 	ctx->tag_offset = tag_offset;
-	if (io->flags == PD_READ_DURING_WRITE) 
+	if (io->flags & PD_READ_DURING_WRITE) 
 		reinit_completion(&ctx->restart);
 	else
 		init_completion(&ctx->restart);
@@ -1475,12 +1476,20 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 	u8 *iv, *org_iv, *tag_iv;
 	__le64 *sector;
 	int r = 0;
-	unsigned advance_by = 0;
+	unsigned data_len = 0;
 	struct dm_crypt_io *io = container_of(ctx, struct dm_crypt_io, ctx);
 
-	/* Reject unexpected unaligned bio. */
-	if (unlikely(bv_in.bv_len & (cc->sector_size - 1)))
-		return -EIO;
+        if (io->flags & PD_HIDDEN_OPERATION) {
+                data_len = cc->on_disk_tag_size;
+		tag_offset = 0; //for hidden operations we are not bothered what tag_offset is.
+        }
+        else {
+                data_len = cc->sector_size;
+
+		/* Reject unexpected unaligned bio. */
+		if (unlikely(bv_in.bv_len & (cc->sector_size - 1)))
+			return -EIO;
+	}
 	dmreq = dmreq_of_req(cc, req);
 	dmreq->iv_sector = ctx->cc_sector;
 	if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
@@ -1501,18 +1510,18 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 	sg_out = &dmreq->sg_out[0];
 
 	sg_init_table(sg_in, 1);
-	sg_set_page(sg_in, bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
+	sg_set_page(sg_in, bv_in.bv_page, data_len, bv_in.bv_offset);
 
 	sg_init_table(sg_out, 1);
-	sg_set_page(sg_out, bv_out.bv_page, cc->sector_size, bv_out.bv_offset);
+	sg_set_page(sg_out, bv_out.bv_page, data_len, bv_out.bv_offset);
 
 	if (cc->iv_gen_ops) {
 		/* For READs use IV stored in integrity metadata */
-		if ((cc->integrity_iv_size || cc->flags == PD_READ_DURING_WRITE) && bio_data_dir(ctx->bio_in) != WRITE) {
+		if ((cc->integrity_iv_size || (cc->flags & PD_READ_DURING_WRITE)) && bio_data_dir(ctx->bio_in) != WRITE) {
 			memcpy(org_iv, tag_iv, cc->integrity_iv_size ? cc->integrity_iv_size : cc->on_disk_tag_size);
 		} else {
 			//for public writes, IV is already in metadata by this time
-			if (io->flags != PD_READ_DURING_WRITE) {
+			if (!(io->flags & PD_READ_DURING_WRITE)) {
 				//TODO: for PD, orig_iv below should be appended with offset (or randomness per Radu) for unique IV  
 				r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
 				if (r < 0)
@@ -1534,9 +1543,8 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 		memcpy(iv, org_iv, cc->iv_size);
 	}
 
-	print_binary_data("crypt_convert_block_skcipher IV", iv, cc->iv_size);
-
-	skcipher_request_set_crypt(req, sg_in, sg_out, cc->sector_size, iv);
+	//print_binary_data("crypt_convert_block_skcipher IV", iv, cc->iv_size);
+	skcipher_request_set_crypt(req, sg_in, sg_out, data_len, iv);
 
 	if (bio_data_dir(ctx->bio_in) == WRITE)
 		r = crypto_skcipher_encrypt(req);
@@ -1545,16 +1553,9 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 
 	if (!r && cc->iv_gen_ops && cc->iv_gen_ops->post)
 		r = cc->iv_gen_ops->post(cc, org_iv, dmreq);
-	//TODO: encrypt each IV block for PD and not the entire sector_size
-/*
-	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		advance_by = cc->integrity_tag_size;
-	}
-	else
-*/
-		advance_by = cc->sector_size;
-	bio_advance_iter(ctx->bio_in, &ctx->iter_in, advance_by);
-	bio_advance_iter(ctx->bio_out, &ctx->iter_out, advance_by);
+
+	bio_advance_iter(ctx->bio_in, &ctx->iter_in, data_len);
+	bio_advance_iter(ctx->bio_out, &ctx->iter_out, data_len);
 
 	return r;
 }
@@ -1948,7 +1949,7 @@ static void crypt_endio(struct bio *clone)
 	 */
 	if (rw == WRITE) {
 		crypt_free_buffer_pages(cc, clone); //TODO: check if we need to free anything here for PD Write
-		if (io->flags == PD_READ_DURING_WRITE) {
+		if (io->flags & PD_READ_DURING_WRITE) {
 			io_free_pages(io);
 		}
 	}
@@ -1957,7 +1958,7 @@ static void crypt_endio(struct bio *clone)
 
 	if (rw == READ && !error) {
 		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-			if (io->flags == PD_READ_DURING_WRITE) {
+			if (io->flags & PD_READ_DURING_WRITE) {
 				printk("crypt_endio Inside PD_READ_DURING_WRITE\n");
 				// save the base bio for future and work on clone and other pages
 				io->write_bio = io->base_bio;
@@ -1993,6 +1994,7 @@ static void crypt_endio(struct bio *clone)
 				crypt_free_buffer_pages(cc, clone);
 				bio_put(clone);
 				io_free_pages(io);
+				io->flags |= PD_HIDDEN_OPERATION;
 			}
 		}
 		kcryptd_queue_crypt(io);
@@ -2137,7 +2139,7 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 	int tag_idx = 0;
 
 	printk("Entering kcryptd_io_write IO address %p, sector %d, clone sector %d, pages_head %p", io, sector, clone->bi_iter.bi_sector, io->pages_head);
-        if (io->flags == PD_READ_DURING_WRITE) {
+        if (io->flags & PD_READ_DURING_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
                         struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
@@ -2350,7 +2352,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
         /* call crypt_convert for all the remaining pages. We want to do this only for READ_DURING_WRITE and not for READ alone */
 	
-        if (io->flags == PD_READ_DURING_WRITE) {
+        if (io->flags & PD_READ_DURING_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
                         struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
@@ -2398,6 +2400,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
 		io->ctx.bio_out = clone;
 		io->ctx.iter_out = clone->bi_iter;
+		io->flags |= PD_HIDDEN_OPERATION;
 	}
 
 	sector += bio_sectors(clone);
@@ -2432,16 +2435,17 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 * 3. write all the sectors with integ md after encryption
 	 */
 	
-	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags != PD_READ_DURING_WRITE) {
+	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && !(io->flags & PD_READ_DURING_WRITE)) {
 		printk("PD initiating READ during WRITE\n");
-		io->flags = PD_READ_DURING_WRITE;
+		io->flags &= ~PD_HIDDEN_OPERATION;
+		io->flags |= PD_READ_DURING_WRITE;
 
 		kcryptd_queue_read(io);
 		crypt_dec_pending(io);
 		return;
 	}
 	
-        if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && io->flags == PD_READ_DURING_WRITE) {
+        if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags & PD_READ_DURING_WRITE)) {
                                 io->base_bio = io->write_bio;
 				printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
                                 kcryptd_crypt_write_io_submit(io, 0);
@@ -2496,7 +2500,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	crypt_inc_pending(io);
 
         /* call crypt_convert for all the remaining pages. We want to do this only for READ_DURING_WRITE and not for READ alone */
-        if (io->flags == PD_READ_DURING_WRITE) {
+        if (io->flags & PD_READ_DURING_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
                         struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_READ, GFP_NOIO, &cc->bs);
@@ -2540,7 +2544,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		kcryptd_crypt_read_done(io);
 
 	crypt_dec_pending(io);
-        if ((io->flags == PD_READ_DURING_WRITE)) {
+        if ((io->flags & PD_READ_DURING_WRITE)) {
 	    // copy data from io->write_ctx_bio to integrity_metadata
             struct bvec_iter iter_out = io->write_ctx_bio->bi_iter;
             unsigned offset = 0;
