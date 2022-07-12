@@ -1982,7 +1982,6 @@ static void crypt_endio(struct bio *clone)
 				io->write_sector = io->sector;
 				io->sector = io->read_sector;
 				io->write_ctx_bio = io->ctx.bio_out;
-				//print_integrity_metadata("Inside crypt_endio, PD_READ_DURING_WRITE integrity ", io->integrity_metadata);
 			}
 			else { // Only READ
 			        struct page *page;
@@ -2006,15 +2005,14 @@ static void crypt_endio(struct bio *clone)
 				// copy intergrity metadata to clone's memory pages
 				struct bvec_iter iter_out = bio->bi_iter;
 				unsigned offset = 0;
-				printk("Inside crypt_endio, before read %d\n", iter_out.bi_size);
+				printk("Inside crypt_endio, before read %d, base bio size %d, size %d\n", iter_out.bi_size, io->base_bio->bi_iter.bi_size, size);
 				while (iter_out.bi_size) {
        					struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
-					char *buffer = kmap_atomic(bv_out.bv_page);
+					char *buffer = page_to_virt(bv_out.bv_page);
 
 					memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, cc->on_disk_tag_size);
 		        		bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
 					offset += cc->on_disk_tag_size;
-					kunmap_atomic(buffer);
 				}
 
 				//print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
@@ -2026,8 +2024,6 @@ static void crypt_endio(struct bio *clone)
 
                                 io->write_bio = io->base_bio;
                                 io->base_bio = bio;
-                                io->write_sector = io->sector;
-                                io->sector = io->read_sector;
 
 				io->flags |= PD_HIDDEN_OPERATION;
 			}
@@ -2619,9 +2615,8 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (atomic_dec_and_test(&io->ctx.cc_pending))
 		kcryptd_crypt_read_done(io);
 
-	crypt_dec_pending(io);
-
 	if (io->flags & PD_HIDDEN_OPERATION) {
+		printk("Inside kcryptd_crypt_read_convert, copying decrypted hiden data to input\n"); 
 		/* restore base bio */
 		io->base_bio = io->write_bio;
                 struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
@@ -2642,6 +2637,8 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		crypt_free_buffer_pages(cc, io->ctx.bio_out);
 		bio_put(io->ctx.bio_out);
 	}
+
+	crypt_dec_pending(io);
 
 	//print_bio("Inside kcryptd_crypt_read_convert,", io->base_bio);
 
