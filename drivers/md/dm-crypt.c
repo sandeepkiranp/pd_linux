@@ -1989,17 +1989,30 @@ static void crypt_endio(struct bio *clone)
         			struct bio_vec *bvec;
         			struct bvec_iter_all iter_all;
 				int count = 0;
+		                unsigned size;
 
-				// copy intergrity metadata to base bio's memory pages
-				struct bvec_iter iter_out = io->base_bio->bi_iter;
+		                if (io->base_bio->bi_iter.bi_size % HIDDEN_BYTES_PER_TAG)
+		                	size = ((io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) + 1) * cc->on_disk_tag_size;
+                		else
+                               		size = (io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) * cc->on_disk_tag_size;
+
+		                struct bio *bio = crypt_alloc_buffer(io, size, 0);
+
+		                if (unlikely(!clone)) {
+		                        io->error = BLK_STS_IOERR;
+		                        return;
+		                }
+
+				// copy intergrity metadata to clone's memory pages
+				struct bvec_iter iter_out = bio->bi_iter;
 				unsigned offset = 0;
 				printk("Inside crypt_endio, before read %d\n", iter_out.bi_size);
-				while (iter_out.bi_size) {	
-       					struct bio_vec bv_out = bio_iter_iovec(io->base_bio, iter_out);
+				while (iter_out.bi_size) {
+       					struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
 					char *buffer = kmap_atomic(bv_out.bv_page);
 
-					memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, HIDDEN_BYTES_PER_TAG);
-		        		bio_advance_iter(io->base_bio, &iter_out, HIDDEN_BYTES_PER_TAG);
+					memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, cc->on_disk_tag_size);
+		        		bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
 					offset += cc->on_disk_tag_size;
 					kunmap_atomic(buffer);
 				}
@@ -2010,6 +2023,12 @@ static void crypt_endio(struct bio *clone)
 				crypt_free_buffer_pages(cc, clone);
 				bio_put(clone);
 				io_free_pages(io);
+
+                                io->write_bio = io->base_bio;
+                                io->base_bio = bio;
+                                io->write_sector = io->sector;
+                                io->sector = io->read_sector;
+
 				io->flags |= PD_HIDDEN_OPERATION;
 			}
 		}
@@ -2055,7 +2074,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	io->pages_head = io->pages_tail = NULL;
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
                 if (io->base_bio->bi_iter.bi_size % HIDDEN_BYTES_PER_TAG)
-			size = ((bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) + 1) * (SECTOR_SIZE << cc->sector_shift);
+			size = ((io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) + 1) * (SECTOR_SIZE << cc->sector_shift);
                 else
 			size = (io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) * (SECTOR_SIZE << cc->sector_shift);
 
@@ -2422,8 +2441,8 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         goto dec;
                 }
 
-	        struct bvec_iter iter_out = clone->bi_iter;
 	        struct bvec_iter iter_in = io->base_bio->bi_iter;
+	        struct bvec_iter iter_out = clone->bi_iter;
                 while (iter_in.bi_size) {
                     struct bio_vec bv_in = bio_iter_iovec(io->base_bio, iter_in);
                     struct bio_vec bv_out = bio_iter_iovec(clone, iter_out);
@@ -2601,6 +2620,28 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		kcryptd_crypt_read_done(io);
 
 	crypt_dec_pending(io);
+
+	if (io->flags & PD_HIDDEN_OPERATION) {
+		/* restore base bio */
+		io->base_bio = io->write_bio;
+                struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
+                struct bvec_iter iter_out = io->base_bio->bi_iter;
+                while (iter_in.bi_size) {
+                    struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
+                    struct bio_vec bv_out = bio_iter_iovec(io->base_bio, iter_out);
+                    char *sbuffer = page_to_virt(bv_in.bv_page);
+                    char *dbuffer = kmap_atomic(bv_out.bv_page);
+
+                    /* Hiddenbytes | RandomBytes | Magic */
+                    memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, HIDDEN_BYTES_PER_TAG);
+
+                    bio_advance_iter(io->base_bio, &iter_in, HIDDEN_BYTES_PER_TAG);
+                    bio_advance_iter(io->ctx.bio_out, &iter_out, cc->on_disk_tag_size);
+                    kunmap_atomic(dbuffer);
+                }
+		crypt_free_buffer_pages(cc, io->ctx.bio_out);
+		bio_put(io->ctx.bio_out);
+	}
 
 	//print_bio("Inside kcryptd_crypt_read_convert,", io->base_bio);
 
