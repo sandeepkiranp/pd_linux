@@ -243,6 +243,10 @@ struct crypt_config {
 #define MAX_TAG_SIZE	480
 #define POOL_ENTRY_SIZE	512
 
+#define HIDDEN_BYTES_PER_TAG 12
+#define RANDOM_BYTES_PER_TAG 3
+#define PD_MAGIC_DATA        0xAA
+
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
 static unsigned dm_crypt_clients_n = 0;
 static volatile unsigned long dm_crypt_pages_per_client;
@@ -1482,7 +1486,6 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 
         if (io->flags & PD_HIDDEN_OPERATION) {
                 data_len = cc->on_disk_tag_size;
-                //data_len = 512;
 		tag_offset = 0; //for hidden operations we are not bothered what tag_offset is.
         }
         else {
@@ -2046,10 +2049,15 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	struct crypt_config *cc = io->cc;
 	struct bio *clone = NULL, *bio = NULL, *prev = NULL;
 	bool chained_bio = false;
+	unsigned size;
 
 	io->pages_head = io->pages_tail = NULL;
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		unsigned size = (io->base_bio->bi_iter.bi_size/cc->on_disk_tag_size) * (SECTOR_SIZE << cc->sector_shift);
+                if (io->base_bio->bi_iter.bi_size % HIDDEN_BYTES_PER_TAG)
+			size = ((bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) + 1) * (SECTOR_SIZE << cc->sector_shift);
+                else
+			size = (io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) * (SECTOR_SIZE << cc->sector_shift);
+
 		unsigned int nr_iovecs = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		unsigned rem_iovecs = nr_iovecs;
 		int tag_idx = 0;
@@ -2400,6 +2408,41 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		crypt_convert_init(cc, ctx, io->base_bio, io->base_bio, sector, &tag_offset);
 		clone = io->base_bio;
 	}
+	else if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
+		unsigned int size;
+                if (io->base_bio->bi_iter.bi_size % HIDDEN_BYTES_PER_TAG)
+                      size  = ((io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) + 1) * cc->on_disk_tag_size;
+                else
+                      size  = (io->base_bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) * cc->on_disk_tag_size;
+
+                clone = crypt_alloc_buffer(io, size, 0);
+                if (unlikely(!clone)) {
+                        io->error = BLK_STS_IOERR;
+                        goto dec;
+                }
+
+	        struct bvec_iter iter_out = clone->bi_iter;
+	        struct bvec_iter iter_in = io->base_bio->bi_iter;
+                while (iter_in.bi_size) {
+                    struct bio_vec bv_in = bio_iter_iovec(io->base_bio, iter_in);
+                    struct bio_vec bv_out = bio_iter_iovec(clone, iter_out);
+		    char *sbuffer = kmap_atomic(bv_in.bv_page);
+                    char *dbuffer = page_to_virt(bv_out.bv_page);
+
+		    /* Hiddenbytes | RandomBytes | Magic */
+                    memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, HIDDEN_BYTES_PER_TAG);
+		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
+		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+
+                    bio_advance_iter(io->base_bio, &iter_in, HIDDEN_BYTES_PER_TAG);
+                    bio_advance_iter(clone, &iter_out, cc->on_disk_tag_size);
+		    kunmap_atomic(sbuffer);
+                }
+
+                crypt_convert_init(cc, ctx, clone, clone, sector, &tag_offset);
+
+                io->flags |= PD_HIDDEN_OPERATION;
+	}
 	else
 	{
 		crypt_convert_init(cc, ctx, NULL, io->base_bio, sector, &tag_offset);
@@ -2412,7 +2455,6 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
 		io->ctx.bio_out = clone;
 		io->ctx.iter_out = clone->bi_iter;
-		io->flags |= PD_HIDDEN_OPERATION;
 	}
 
 	sector += bio_sectors(clone);
@@ -3891,8 +3933,11 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 
 	if (cc->on_disk_tag_size) {
 		unsigned tag_len;
-		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) 
-			tag_len = bio->bi_iter.bi_size;
+		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
+			if (bio->bi_iter.bi_size % HIDDEN_BYTES_PER_TAG)
+				tag_len = ((bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) + 1) * cc->on_disk_tag_size;
+			else
+				tag_len = (bio->bi_iter.bi_size/HIDDEN_BYTES_PER_TAG) * cc->on_disk_tag_size;
 		else
 			tag_len = cc->on_disk_tag_size * (bio_sectors(bio) >> cc->sector_shift);
 		printk("crypt_map tag len = %d, bio_sectors %d, sector_shift %d", tag_len, bio_sectors(bio), cc->sector_shift);
