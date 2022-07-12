@@ -2630,8 +2630,8 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                     /* Hiddenbytes | RandomBytes | Magic */
                     memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, HIDDEN_BYTES_PER_TAG);
 
-                    bio_advance_iter(io->base_bio, &iter_in, HIDDEN_BYTES_PER_TAG);
-                    bio_advance_iter(io->ctx.bio_out, &iter_out, cc->on_disk_tag_size);
+                    bio_advance_iter(io->base_bio, &iter_out, HIDDEN_BYTES_PER_TAG);
+                    bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
                     kunmap_atomic(dbuffer);
                 }
 		crypt_free_buffer_pages(cc, io->ctx.bio_out);
