@@ -1998,11 +1998,12 @@ static void crypt_endio(struct bio *clone)
        					struct bio_vec bv_out = bio_iter_iovec(io->base_bio, iter_out);
 					char *buffer = kmap_atomic(bv_out.bv_page);
 
-					memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, cc->sector_size);
-		        		bio_advance_iter(io->base_bio, &iter_out, cc->sector_size);
-					offset += cc->sector_size;
+					memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, HIDDEN_BYTES_PER_TAG);
+		        		bio_advance_iter(io->base_bio, &iter_out, HIDDEN_BYTES_PER_TAG);
+					offset += cc->on_disk_tag_size;
 					kunmap_atomic(buffer);
 				}
+
 				//print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
 				//print_bio("Inside crypt_endio", io->base_bio);
 				// Free clone and all the pages. We dont need them anymore
@@ -2612,9 +2613,9 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 struct bio_vec bv_out = bio_iter_iovec(io->write_ctx_bio, iter_out);
                 char *buffer = page_to_virt(bv_out.bv_page);
 
-                memcpy(io->integrity_metadata + offset, buffer + bv_out.bv_offset, cc->sector_size);
-                bio_advance_iter(io->write_ctx_bio, &iter_out, cc->sector_size);
-                offset += cc->sector_size;
+                memcpy(io->integrity_metadata + offset, buffer + bv_out.bv_offset, cc->on_disk_tag_size);
+                bio_advance_iter(io->write_ctx_bio, &iter_out, cc->on_disk_tag_size);
+                offset += cc->on_disk_tag_size;
 		//printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
 	    //print_integrity_metadata("kcryptd_crypt_read_convert", io->integrity_metadata);
