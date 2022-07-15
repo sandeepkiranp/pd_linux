@@ -1663,12 +1663,12 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 	unsigned int step_count = 0;
 
 	if (io->flags & PD_HIDDEN_OPERATION)
-		steps_per_sector = cc->sector_size / io->cc->on_disk_tag_size;
+		steps_per_sector = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 	else
 		steps_per_sector = 1;
 
-		printk("crypt_convert tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
-				*tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+		printk("crypt_convert sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
+				ctx->cc_sector, *tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
 	/*
 	 * if reset_pending is set we are dealing with the bio for the first time,
 	 * else we're continuing to work on the previous bio, so don't mess with
@@ -1677,9 +1677,13 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 	if (reset_pending)
 		atomic_set(&ctx->cc_pending, 1);
 
+	int prev_sector = 0;
 	while (ctx->iter_in.bi_size && ctx->iter_out.bi_size) {
-		//printk("tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
-		//		*tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+		if (prev_sector != ctx->cc_sector) {	
+		printk("sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
+				ctx->cc_sector, *tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+		prev_sector = ctx->cc_sector;
+		}
 
 		r = crypt_alloc_req(cc, ctx);
 		if (r) {
