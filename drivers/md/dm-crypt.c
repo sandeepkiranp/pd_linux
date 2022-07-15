@@ -2622,7 +2622,6 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (io->flags & PD_HIDDEN_OPERATION) {
 		/* restore base bio */
 		io->base_bio = io->write_bio;
-#if 0
 		printk("Inside kcryptd_crypt_read_convert, copying decrypted hiden data to input. hidden data size %d, input size %d\n",
 				io->ctx.bio_out->bi_iter.bi_size, io->base_bio->bi_iter.bi_size); 
                 struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
@@ -2637,9 +2636,9 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		    if (bv_out.bv_len < copy_bytes) {
 			unsigned small_copy = bv_out.bv_len;
 			memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, small_copy);
+                        kunmap_atomic(dbuffer);
 			bio_advance_iter(io->base_bio, &iter_out, small_copy);
 			bv_out = bio_iter_iovec(io->base_bio, iter_out);
-                        kunmap_atomic(dbuffer);
                         dbuffer = kmap_atomic(bv_out.bv_page);
 			memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset + small_copy, copy_bytes - small_copy);
 			copy_bytes = copy_bytes - small_copy;
@@ -2654,7 +2653,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                     kunmap_atomic(dbuffer);
 		    //printk("kcryptd_crypt_read_convert, remaining input size %d, remaining hidden data size %d\n", iter_out.bi_size, iter_in.bi_size);
                 }
-#endif
+#if 0
 				struct bvec_iter iter_out = io->base_bio->bi_iter;
 				while (iter_out.bi_size) {	
        					struct bio_vec bv_out = bio_iter_iovec(io->base_bio, iter_out);
@@ -2662,14 +2661,29 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 					printk("kcryptd_crypt_read_convert, pending size %d", iter_out.bi_size);
 					char str[16] = {0};
 		    			unsigned copy_bytes = min_t(unsigned, 12, iter_out.bi_size);
-					copy_bytes = min_t(unsigned, copy_bytes, bv_out.bv_len);
+			                    if (bv_out.bv_len < copy_bytes) {
+                       				unsigned small_copy = bv_out.bv_len;
+						printk("kcryptd_crypt_read_convert, trying small copy %d, offset %d, len %d", small_copy, bv_out.bv_offset, bv_out.bv_len);
+			                        memcpy(buffer + bv_out.bv_offset, str, small_copy);
+                        			kunmap_atomic(buffer);
+			                        bio_advance_iter(io->base_bio, &iter_out, small_copy);
+			                        bv_out = bio_iter_iovec(io->base_bio, iter_out);
+			                        buffer = kmap_atomic(bv_out.bv_page);
+						printk("kcryptd_crypt_read_convert, trying remaining copy %d, offset %d, len %d", copy_bytes - small_copy, bv_out.bv_offset, bv_out.bv_len);
+			                        memcpy(buffer + bv_out.bv_offset, str + small_copy, copy_bytes - small_copy);
+			                        copy_bytes = copy_bytes - small_copy;
+			                    }
+		                    else {
+
 					printk("kcryptd_crypt_read_convert, trying to copy %d, offset %d, len %d", copy_bytes, bv_out.bv_offset, bv_out.bv_len);
 
 					memcpy(buffer + bv_out.bv_offset, str, copy_bytes);
+				    }
 		        		bio_advance_iter(io->base_bio, &iter_out, copy_bytes);
 					printk("kcryptd_crypt_read_convert, advance iter by %d", copy_bytes);
 					kunmap_atomic(buffer);
 				}
+#endif
 		crypt_free_buffer_pages(cc, io->ctx.bio_out);
 		bio_put(io->ctx.bio_out);
 	}
