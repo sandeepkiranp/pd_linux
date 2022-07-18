@@ -41,6 +41,10 @@
 #include <keys/trusted-type.h>
 
 #include <linux/device-mapper.h>
+#include <linux/fs.h>
+#include <asm/segment.h>
+#include <asm/uaccess.h>
+#include <linux/buffer_head.h>
 
 #include "dm-audit.h"
 
@@ -261,6 +265,8 @@ static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async);
 
 static bool crypt_integrity_aead(struct crypt_config *cc);
 
+struct file *bio_file = NULL;
+
 void print_integrity_metadata(char *msg, char *data)
 {
 	char str[200] = {0};
@@ -277,7 +283,7 @@ void print_integrity_metadata(char *msg, char *data)
 	}
 }
 
-void print_binary_data(char *msg, char *data, int len)
+char *print_binary_data(char *data, int len)
 {
 	char *str = kmalloc(3 * len + 1, GFP_KERNEL);
 	int i;
@@ -289,25 +295,54 @@ void print_binary_data(char *msg, char *data, int len)
                 {
                         sprintf(str + strlen(str), "%02hhx ", data[i]);
                 }
-                printk("%s - Binary data %s\n", msg, str);
         }
-	kfree(str);
+	return(str);
+}
+
+struct file *file_open(const char *path, int flags, int rights)
+{
+    struct file *filp = NULL;
+    int err = 0;
+
+    filp = filp_open(path, flags, rights);
+    if (IS_ERR(filp)) {
+        err = PTR_ERR(filp);
+        return NULL;
+    }
+    return filp;
+}
+
+
+void file_close(struct file *file)
+{
+    filp_close(file, NULL);
 }
 
 void print_bio(char *msg, struct bio *bio)
 {
             struct bvec_iter iter_out = bio->bi_iter;
 	    int count = 0;
-            printk("print_bio, size %d, starting sector %d, num of sectors %d\n", iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+            char *str;	    
+	    char *p = NULL;
+
+	    printk("\nprint_bio, %p, %s, size %d, starting sector %d, num of sectors %d\n", bio_file, msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+
+            p = kasprintf(GFP_KERNEL, "\nprint_bio, %s, size %d, starting sector %d, num of sectors %d\n", msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+	    kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
             while (iter_out.bi_size) {
+		unsigned size = min_t(unsigned, 512, iter_out.bi_size);
                 struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                 char *buffer = page_to_virt(bv_out.bv_page);
 		printk("print_bio bv offset %d, bv len %d\n", bv_out.bv_offset, bv_out.bv_len);
-		print_binary_data(msg, buffer + bv_out.bv_offset, 512);
-                bio_advance_iter(bio, &iter_out, 512);
-		if (++count >= 10)
+		str = print_binary_data(buffer + bv_out.bv_offset, size);
+		kernel_write(bio_file, str, strlen(str), &bio_file->f_pos);
+		kfree(str);
+                bio_advance_iter(bio, &iter_out, size);
+		if (++count >= 4)
 			break;
             }
+	    if (p)
+		kfree(p);
 }
 
 /*
@@ -2014,12 +2049,11 @@ static void crypt_endio(struct bio *clone)
 					char *buffer = page_to_virt(bv_out.bv_page);
 
 					memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, cc->on_disk_tag_size);
-					//memcpy(buffer + bv_out.bv_offset, "ssssssssssssssss", cc->on_disk_tag_size);
 		        		bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
 					offset += cc->on_disk_tag_size;
 				}
 
-				//print_bio("Inside crypt_endio", bio);
+				print_bio("Inside crypt_endio", bio);
 
 				//print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
 				//print_bio("Inside crypt_endio", io->base_bio);
@@ -3275,6 +3309,8 @@ static void crypt_dtr(struct dm_target *ti)
 	if (cc->crypt_queue)
 		destroy_workqueue(cc->crypt_queue);
 
+	file_close(bio_file);
+
 	crypt_free_tfms(cc);
 
 	bioset_exit(&cc->bs);
@@ -3954,6 +3990,8 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Couldn't spawn write thread";
 		goto bad;
 	}
+
+	bio_file = file_open("/tmp/bio", O_WRONLY, 0);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
