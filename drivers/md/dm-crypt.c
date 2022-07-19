@@ -2538,7 +2538,6 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	sector += bio_sectors(clone);
 
 	crypt_inc_pending(io);
-	if (!(io->flags & PD_HIDDEN_OPERATION)) {
 	r = crypt_convert(cc, ctx,
 			  test_bit(DM_CRYPT_NO_WRITE_WORKQUEUE, &cc->flags), true);
 	/*
@@ -2560,9 +2559,6 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		wait_for_completion(&ctx->restart);
 		crypt_finished = 1;
 	}
-	}
-	else
-		crypt_finished = 1;
 
 	//if (!(io->flags & PD_READ_DURING_WRITE))
 	//	print_bio("kcryptd_crypt_write_convert", io->ctx.bio_out);
@@ -2664,7 +2660,6 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 	crypt_convert_init(cc, &io->ctx, io->base_bio, io->base_bio,
 			   sector, &tag_offset);
-	if (! (io->flags & PD_HIDDEN_OPERATION)) {
 	r = crypt_convert(cc, &io->ctx,
 			  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
 	/*
@@ -2681,9 +2676,6 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 	if (atomic_dec_and_test(&io->ctx.cc_pending))
 		kcryptd_crypt_read_done(io);
-	}
-	else
-		kcryptd_crypt_read_done(io);		
 
 	if (io->flags & PD_HIDDEN_OPERATION) {
 		unsigned total_copied = 0;
