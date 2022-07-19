@@ -307,6 +307,7 @@ struct file *file_open(const char *path, int flags, int rights)
     filp = filp_open(path, flags, rights);
     if (IS_ERR(filp)) {
         err = PTR_ERR(filp);
+	printk("Error opening %s, %d\n", path, err);
         return NULL;
     }
     return filp;
@@ -325,15 +326,18 @@ void print_bio(char *msg, struct bio *bio)
             char *str;	    
 	    char *p = NULL;
 
-	    printk("\nprint_bio, %p, %s, size %d, starting sector %d, num of sectors %d\n", bio_file, msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+	    if (!bio_file)
+		    return;
 
-            p = kasprintf(GFP_KERNEL, "\nprint_bio, %s, size %d, starting sector %d, num of sectors %d\n", msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+	    printk("\nprint_bio, %p, %s, size %d, starting sector %d, num of sectors %d\n", bio_file, msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+	    p = kasprintf(GFP_KERNEL, "\nprint_bio, %s, total bio size %d, starting sector %d, num of sectors %d\n", msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
 	    kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
             while (iter_out.bi_size) {
+            	p = kasprintf(GFP_KERNEL, "\nremaining size %d, current sector %d\n", iter_out.bi_size, iter_out.bi_sector);
+	    	kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
 		unsigned size = min_t(unsigned, 512, iter_out.bi_size);
                 struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                 char *buffer = page_to_virt(bv_out.bv_page);
-		printk("print_bio bv offset %d, bv len %d\n", bv_out.bv_offset, bv_out.bv_len);
 		str = print_binary_data(buffer + bv_out.bv_offset, size);
 		kernel_write(bio_file, str, strlen(str), &bio_file->f_pos);
 		kfree(str);
@@ -2053,7 +2057,7 @@ static void crypt_endio(struct bio *clone)
 					offset += cc->on_disk_tag_size;
 				}
 
-				print_bio("Inside crypt_endio", bio);
+				//print_bio("Inside crypt_endio", bio);
 
 				//print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
 				//print_bio("Inside crypt_endio", io->base_bio);
@@ -2462,6 +2466,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	}
 	else if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		unsigned int size;
+		unsigned total_copied = 0;
                 unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
                 size = num_sectors * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
 
@@ -2471,6 +2476,8 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         goto dec;
                 }
 
+		print_bio("kcryptd_crypt_write_convert base bio", io->base_bio);
+
 	        struct bvec_iter iter_in = io->base_bio->bi_iter;
 	        struct bvec_iter iter_out = clone->bi_iter;
                 while (iter_in.bi_size) {
@@ -2479,6 +2486,8 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		    char *sbuffer = kmap_atomic(bv_in.bv_page);
                     char *dbuffer = page_to_virt(bv_out.bv_page);
 		    unsigned copy_bytes = min_t(unsigned, HIDDEN_BYTES_PER_TAG, iter_in.bi_size);
+		    if (total_copied + copy_bytes > cc->sector_size)
+			    copy_bytes = cc->sector_size - total_copied; 
 
                     if (bv_in.bv_len < copy_bytes) {
                         unsigned small_copy = bv_in.bv_len;
@@ -2501,13 +2510,16 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                     bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
                     bio_advance_iter(clone, &iter_out, cc->on_disk_tag_size);
 		    kunmap_atomic(sbuffer);
+		    total_copied += copy_bytes;
+		    if (total_copied == cc->sector_size)
+			total_copied = 0;
                 }
 
                 crypt_convert_init(cc, ctx, clone, clone, sector, &tag_offset);
 
                 io->flags |= PD_HIDDEN_OPERATION;
 
-		//print_bio("write_convert", clone);
+		print_bio("write_convert after randombytes and magic", clone);
 	}
 	else
 	{
@@ -2674,6 +2686,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		kcryptd_crypt_read_done(io);		
 
 	if (io->flags & PD_HIDDEN_OPERATION) {
+		unsigned total_copied = 0;
 		/* restore base bio */
 		io->base_bio = io->write_bio;
 		printk("Inside kcryptd_crypt_read_convert, copying decrypted hiden data to input. hidden data size %d, input size %d\n",
@@ -2686,6 +2699,8 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                     char *sbuffer = page_to_virt(bv_in.bv_page);
                     char *dbuffer = kmap_atomic(bv_out.bv_page);
 		    unsigned copy_bytes = min_t(unsigned, HIDDEN_BYTES_PER_TAG, iter_out.bi_size);
+                    if (total_copied + copy_bytes > cc->sector_size)
+                            copy_bytes = cc->sector_size - total_copied; 
 
 		    if (bv_out.bv_len < copy_bytes) {
 			unsigned small_copy = bv_out.bv_len;
@@ -2706,8 +2721,12 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                     bio_advance_iter(io->base_bio, &iter_out, copy_bytes);
                     bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
                     kunmap_atomic(dbuffer);
+                    total_copied += copy_bytes;
+                    if (total_copied == cc->sector_size)
+                        total_copied = 0;
 		    //printk("kcryptd_crypt_read_convert, remaining input size %d, remaining hidden data size %d\n", iter_out.bi_size, iter_in.bi_size);
                 }
+		//print_bio("Inside kcryptd_crypt_read_convert base bio", io->base_bio);
 		crypt_free_buffer_pages(cc, io->ctx.bio_out);
 		bio_put(io->ctx.bio_out);
 	}
@@ -2732,7 +2751,6 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->on_disk_tag_size;
 		//printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
-	    //print_integrity_metadata("kcryptd_crypt_read_convert", io->integrity_metadata);
 
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
@@ -3991,7 +4009,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-	bio_file = file_open("/tmp/bio", O_WRONLY, 0);
+	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
