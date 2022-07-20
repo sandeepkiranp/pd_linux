@@ -2043,6 +2043,7 @@ static void crypt_endio(struct bio *clone)
 		                        io->error = BLK_STS_IOERR;
 		                        return;
 		                }
+				bio->bi_opf = REQ_OP_READ;
 
 				// copy intergrity metadata to bio's memory pages
 				struct bvec_iter iter_out = bio->bi_iter;
@@ -2078,14 +2079,14 @@ static void crypt_endio(struct bio *clone)
                         struct bio_vec *bvec;
                         struct bvec_iter_all iter_all;
                         int count = 0;
-                        unsigned size;
-                        size = bio_sectors(io->base_bio) * cc->on_disk_tag_size;
+                        unsigned size = bio_sectors(io->base_bio) * cc->on_disk_tag_size;
                         struct bio *bio = crypt_alloc_buffer(io, size, 0);
 
                         if (unlikely(!bio)) {
                                 io->error = BLK_STS_IOERR;
                                 return;
                         }
+			bio->bi_opf = REQ_OP_READ;
 
                         // copy intergrity metadata to bio's memory pages
                         struct bvec_iter iter_out = bio->bi_iter;
@@ -2110,7 +2111,6 @@ static void crypt_endio(struct bio *clone)
 
                         io->write_bio = io->base_bio;
                         io->base_bio = bio;
-                        io->write_ctx_bio = io->ctx.bio_out;
 
                         io->flags |= PD_HIDDEN_OPERATION;
 		}
@@ -2202,6 +2202,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
                         return 1;
                 }
 		clone->bi_opf = REQ_INTEGRITY | REQ_OP_READ;
+		clone->bi_iter.bi_sector = cc->start + io->sector;
 	}
 	else {
 	        /*
@@ -2213,24 +2214,20 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	        clone = bio_alloc_clone(cc->dev->bdev, io->base_bio, gfp, &cc->bs);
 	        if (!clone)
         	        return 1;
+                clone->bi_iter.bi_sector = cc->start + io->sector;
+
+                if (dm_crypt_integrity_io_alloc(io, clone, 0)) {
+                        crypt_dec_pending(io);
+                        bio_put(clone);
+                        return 1;
+                }
+
 	}
 	clone->bi_private = io;
 	clone->bi_end_io = crypt_endio;
 
 	crypt_inc_pending(io);
 
-	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		printk("dm-crypt, setting BIO_INTEGRITY_METADATA_ONLY, bio integ payload is %p\n", bio_integrity(clone));
-	}
-	else {
-		clone->bi_iter.bi_sector = cc->start + io->sector;
-
-		if (dm_crypt_integrity_io_alloc(io, clone, 0)) {
-			crypt_dec_pending(io);
-			bio_put(clone);
-			return 1;
-		}
-	}
 	printk("kcryptd_io_read Incoming sector %ld, incomign size %d, outgoing sector %ld, outgoing size %d", 
 			io->sector, io->base_bio->bi_iter.bi_size, clone->bi_iter.bi_sector, clone->bi_iter.bi_size);
 	dm_submit_bio_remap(io->base_bio, clone);
@@ -2575,11 +2572,9 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                 printk("PD initiating READ during PUBLIC WRITE\n");
                 io->flags |= PD_READ_DURING_PUBLIC_WRITE;
                 kcryptd_queue_read(io);
-                crypt_dec_pending(io);
                 return;
 	}
 	else {
-
 		crypt_convert_init(cc, ctx, NULL, io->base_bio, sector, &tag_offset);
 
 		clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size, 0);
@@ -2644,7 +2639,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                                 return;
 	
         }
-        if ((io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
+        if (crypt_finished && (io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                                 printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
                                 kcryptd_crypt_write_io_submit(io, 0);
                                 crypt_dec_pending(io);
@@ -2842,10 +2837,8 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		io->base_bio = io->write_bio;
                 // write the whole thing
                 printk("kcryptd_crypt_read_convert, encrypting and writing %d bytes\n", io->base_bio->bi_iter.bi_size);
-                io->base_bio->bi_opf = REQ_OP_WRITE;
 
                 kcryptd_crypt_write_convert(io);
-                crypt_dec_pending(io);
 	}
 
 	crypt_dec_pending(io);
