@@ -330,11 +330,11 @@ void print_bio(char *msg, struct bio *bio)
 	    if (!bio_file)
 		    return;
 
-	    printk("\nprint_bio, %p, %s, size %d, starting sector %d, num of sectors %d\n", bio_file, msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
-	    p = kasprintf(GFP_KERNEL, "\nprint_bio, %s, total bio size %d, starting sector %d, num of sectors %d\n", msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+	    printk("print_bio, %p, %s, size %d, starting sector %d, num of sectors %d\n", bio_file, msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
+	    p = kasprintf(GFP_KERNEL, "\n\nprint_bio, %s, total bio size %d, starting sector %d, num of sectors %d\n", msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
 	    kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
             while (iter_out.bi_size) {
-            	p = kasprintf(GFP_KERNEL, "\nremaining size %d, current sector %d\n", iter_out.bi_size, iter_out.bi_sector);
+            	p = kasprintf(GFP_KERNEL, "remaining size %d, current sector %d\n", iter_out.bi_size, iter_out.bi_sector);
 	    	kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
 		unsigned size = min_t(unsigned, 512, iter_out.bi_size);
                 struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
@@ -1587,8 +1587,11 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 		/* Working copy of IV, to be modified in crypto API */
 		memcpy(iv, org_iv, cc->iv_size);
 	}
-
-	//print_binary_data("crypt_convert_block_skcipher IV", iv, cc->iv_size);
+	if (io->flags & PD_HIDDEN_OPERATION) {
+		char *str = print_binary_data(iv, cc->iv_size);
+		//printk("crypt_convert_block_skcipher IV %s, %s\n", (bio_data_dir(ctx->bio_in) == WRITE) ? "WRITE" : "READ", str);
+		kfree(str);
+	}
 	skcipher_request_set_crypt(req, sg_in, sg_out, data_len, iv);
 
 	if (bio_data_dir(ctx->bio_in) == WRITE)
@@ -1698,17 +1701,10 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 	unsigned int *tag_offset = ctx->tag_offset;
 	unsigned int sector_step = cc->sector_size >> SECTOR_SHIFT;
 	int r;
-	struct dm_crypt_io *io = container_of(ctx, struct dm_crypt_io, ctx);
-	unsigned int steps_per_sector;
-	unsigned int step_count = 0;
 
-	if (io->flags & PD_HIDDEN_OPERATION)
-		steps_per_sector = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
-	else
-		steps_per_sector = 1;
-
-		printk("crypt_convert sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
-				ctx->cc_sector, *tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+		printk("crypt_convert %s sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
+				(bio_data_dir(ctx->bio_in) == WRITE) ? "WRITE" : "READ", ctx->cc_sector, *tag_offset, 
+				ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
 	/*
 	 * if reset_pending is set we are dealing with the bio for the first time,
 	 * else we're continuing to work on the previous bio, so don't mess with
@@ -1717,13 +1713,9 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 	if (reset_pending)
 		atomic_set(&ctx->cc_pending, 1);
 
-	int prev_sector = 0;
 	while (ctx->iter_in.bi_size && ctx->iter_out.bi_size) {
-		if (prev_sector != ctx->cc_sector) {	
 		//printk("sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
 		//		ctx->cc_sector, *tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
-		prev_sector = ctx->cc_sector;
-		}
 
 		r = crypt_alloc_req(cc, ctx);
 		if (r) {
@@ -1756,9 +1748,7 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 					 * exit and continue processing in a workqueue
 					 */
 					ctx->r.req = NULL;
-					step_count++;
-					if (step_count % steps_per_sector == 0)
-						ctx->cc_sector += sector_step;
+					ctx->cc_sector += sector_step;
 					*tag_offset = *tag_offset + 1;
 					return BLK_STS_DEV_RESOURCE;
 				}
@@ -1773,9 +1763,7 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 		 */
 		case -EINPROGRESS:
 			ctx->r.req = NULL;
-			step_count++;
-			if (step_count % steps_per_sector == 0)
-				ctx->cc_sector += sector_step;
+			ctx->cc_sector += sector_step;
 			*tag_offset = *tag_offset + 1;
 			continue;
 		/*
@@ -1783,9 +1771,7 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 		 */
 		case 0:
 			atomic_dec(&ctx->cc_pending);
-			step_count++;
-			if (step_count % steps_per_sector == 0)
-				ctx->cc_sector += sector_step;
+			ctx->cc_sector += sector_step;
 			*tag_offset = *tag_offset + 1;
 			if (!atomic)
 				cond_resched();
@@ -2039,6 +2025,9 @@ static void crypt_endio(struct bio *clone)
         	                size = num_sectors * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
 		                struct bio *bio = crypt_alloc_buffer(io, size, 0);
 
+				io->write_sector = io->sector;
+				io->sector = io->read_sector;
+
 		                if (unlikely(!bio)) {
 		                        io->error = BLK_STS_IOERR;
 		                        return;
@@ -2101,7 +2090,7 @@ static void crypt_endio(struct bio *clone)
                                 offset += cc->on_disk_tag_size;
                         }
 
-                        //print_bio("Inside crypt_endio", bio);
+                        print_bio("Inside crypt_endio, hidden data before decryption", bio);
 
                         //print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
                         //print_bio("Inside crypt_endio", io->base_bio);
@@ -2522,6 +2511,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         io->error = BLK_STS_IOERR;
                         goto dec;
                 }
+		clone->bi_opf = REQ_OP_WRITE;
 
 		//print_bio("kcryptd_crypt_write_convert base bio", io->base_bio);
 
@@ -2562,11 +2552,11 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			total_copied = 0;
                 }
 
-                crypt_convert_init(cc, ctx, clone, clone, sector, &tag_offset);
+                crypt_convert_init(cc, ctx, clone, clone, num_sectors * sector, &tag_offset);
 
                 io->flags |= PD_HIDDEN_OPERATION;
 
-		//print_bio("write_convert after randombytes and magic", clone);
+		print_bio("write_convert after randombytes and magic", clone);
 	}
 	else if (!(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                 printk("PD initiating READ during PUBLIC WRITE\n");
@@ -2633,18 +2623,16 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags & PD_READ_DURING_WRITE)) {
                                 io->base_bio = io->write_bio;
-				printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
+                                printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
                                 kcryptd_crypt_write_io_submit(io, 0);
                                 crypt_dec_pending(io);
                                 return;
-	
         }
         if (crypt_finished && (io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                                 printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
                                 kcryptd_crypt_write_io_submit(io, 0);
                                 crypt_dec_pending(io);
                                 return;
-
         }
 
 	/* Encryption was already finished, submit io now */
@@ -2784,16 +2772,19 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
+		print_bio("kcryptd_crypt_read_convert, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			if(buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+				printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV\n");
 				//refresh the randomness	
 		                //get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
                 		memcpy(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, "111", RANDOM_BYTES_PER_TAG);
 
 			}
 			else {
+				printk("No hidden data present, generating random IV\n");
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
 			}
@@ -2801,6 +2792,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		}
 		//re-encrypt the bio
 		struct bio *bio = io->ctx.bio_out;
+		bio->bi_opf = REQ_OP_WRITE; 
 	        crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 	        r = crypt_convert(cc, &io->ctx,
         	                  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
@@ -2837,8 +2829,9 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		io->base_bio = io->write_bio;
                 // write the whole thing
                 printk("kcryptd_crypt_read_convert, encrypting and writing %d bytes\n", io->base_bio->bi_iter.bi_size);
-
+		io->flags &= ~PD_HIDDEN_OPERATION;
                 kcryptd_crypt_write_convert(io);
+		crypt_dec_pending(io);
 	}
 
 	crypt_dec_pending(io);
@@ -2860,6 +2853,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->on_disk_tag_size;
 		//printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
+	    print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
 
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
