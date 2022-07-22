@@ -1562,8 +1562,15 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 	sg_set_page(sg_out, bv_out.bv_page, data_len, bv_out.bv_offset);
 
 	if (cc->iv_gen_ops) {
+		
+		if((io->flags & PD_READ_DURING_PUBLIC_WRITE) && (io->flags & PD_HIDDEN_OPERATION)) {
+		    //kludge to get it working
+                    r = crypt_iv_plain_gen(cc, org_iv, dmreq);
+                    if (r < 0)
+                        return r;
+		}
 		/* For READs use IV stored in integrity metadata */
-		if ((cc->integrity_iv_size || (cc->flags & PD_READ_DURING_WRITE)) && bio_data_dir(ctx->bio_in) != WRITE) {
+		else if ((cc->integrity_iv_size || (io->flags & PD_READ_DURING_WRITE)) && bio_data_dir(ctx->bio_in) != WRITE) {
 			memcpy(org_iv, tag_iv, cc->integrity_iv_size ? cc->integrity_iv_size : cc->on_disk_tag_size);
 		} else {
 			//for public writes, IV is already in metadata by this time
@@ -2776,7 +2783,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
-			if(buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
 				printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV\n");
 				//refresh the randomness	
 		                //get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
@@ -2784,7 +2791,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 			}
 			else {
-				printk("No hidden data present, generating random IV\n");
+				printk("No hidden data present (magic %02hhx), generating random IV\n", buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG]);
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
 			}
