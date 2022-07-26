@@ -248,8 +248,8 @@ struct crypt_config {
 #define MAX_TAG_SIZE	480
 #define POOL_ENTRY_SIZE	512
 
-#define HIDDEN_BYTES_PER_TAG 12
-#define RANDOM_BYTES_PER_TAG 3
+#define HIDDEN_BYTES_PER_TAG 14
+#define RANDOM_BYTES_PER_TAG 1
 #define PD_MAGIC_DATA        0xAA
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
@@ -2547,8 +2547,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		        /* Hiddenbytes | RandomBytes | Magic */
                         memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 		    }
-		    //get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
-		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, "000", RANDOM_BYTES_PER_TAG);
+		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
 		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 
                     bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
@@ -2786,8 +2785,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
 				printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV\n");
 				//refresh the randomness	
-		                //get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
-                		memcpy(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, "111", RANDOM_BYTES_PER_TAG);
+		                get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
 
 			}
 			else {
