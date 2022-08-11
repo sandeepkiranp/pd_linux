@@ -504,8 +504,16 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
 		prev_x = prev_c_x = NULL;
         }
 	//UNLOCK
-	if(current_sector_count != sector_count)
+	if(current_sector_count != sector_count) {
+		//on failure, restore any sectors added to results
+		int i = 0, j = 0;
+		while(results[i].start) {
+			for(j = results[i].start; j < results[i].start + results[i].len; j++)
+				addto_freelist(j);
+			i++;
+		}
 		return -1;
+	}
 	else
 		return 0;
 }
@@ -2317,52 +2325,55 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		size = num_sectors * bio_sectors(io->base_bio) * (SECTOR_SIZE << cc->sector_shift);
 		unsigned rem_size = size;
 		int tag_idx = 0;
+		struct freelist_results results[num_sectors] = {0};
+		int i, j;
 
-		// read list of sectors from freelist
-		if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
-			int i = 0;
-			for (i = 0; i < bio_sectors(io->base_bio); i++)
-				getfrom_freelist(num_sectors);
-		}
-		// read list of sectors from B Tree
-		else {
+		for (i = 0; i < bio_sectors(io->base_bio); i++) {
+			// read list of sectors from freelist
+			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
+				if(getfrom_freelist(num_sectors, results)) {
+					printk("Unable to find %d public sectors for hidden write\n", num_sectors);
+					//TODO: set io->error
+					return 1;
+				}
+			}
+			// read list of sectors from B Tree
+			else {
 		
 
-		}
-
-		while(rem_size > 0) {
-			unsigned assigned = min_t(unsigned, rem_size, BIO_MAX_VECS * PAGE_SIZE);
-			printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
-                	bio = crypt_alloc_buffer(io, assigned, tag_idx);
-                	if (unlikely(!bio)) {
-                       		io->error = BLK_STS_IOERR;
-                        	return 1;
-                	}
-			bio->bi_opf = REQ_INTEGRITY | REQ_OP_READ;
-			bio->bi_private = NULL;
-			bio->bi_end_io = NULL;
-
-			if(!prev) {
-				bio->bi_iter.bi_sector = io->read_sector = cc->start + num_sectors * io->sector;
 			}
-			else {
-				/* add pages of the new bio to io and submit the prev bio */
-	        		struct bio_vec *bv;
-			        struct bvec_iter_all iter_all;
+			//TODO: club adjacent sectors to increase performance
 
-			        bio_for_each_segment_all(bv, prev, iter_all) {
-					io_add_bio_vec(io, bv);
-        			}
+			while(results[i].start) {
+				unsigned assigned = results[i].len * cc->sector_size;
+				printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
+       		         	bio = crypt_alloc_buffer(io, assigned, tag_idx);
+       		         	if (unlikely(!bio)) {
+       	                		io->error = BLK_STS_IOERR;
+       		                 	return 1;
+       		         	}
+				bio->bi_opf = REQ_INTEGRITY | REQ_OP_READ;
+				bio->bi_private = NULL;
+				bio->bi_end_io = NULL;
+				bio->bi_iter.bi_sector = io->read_sector = cc->start + results[i].start; //TODO: fix io->read_sector
 
-				printk("chaining bio and submitting previous bio\n");
-				bio->bi_iter.bi_sector = bio_end_sector(prev);
-				bio_chain(prev, bio);
-				dm_submit_bio_remap(io->base_bio, prev);
+				if(prev) {
+					/* add pages of the prev bio to io and submit the prev bio */
+		        		struct bio_vec *bv;
+				        struct bvec_iter_all iter_all;
+
+				        bio_for_each_segment_all(bv, prev, iter_all) {
+						io_add_bio_vec(io, bv);
+       		 			}
+
+					printk("chaining bio and submitting previous bio\n");
+					bio_chain(prev, bio);
+					dm_submit_bio_remap(io->base_bio, prev);
+				}
+				printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
+				prev = bio;
+				tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 			}
-			printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
-			rem_size -= assigned;
-			prev = bio;
-			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 		}
 		clone = bio;
 	}
