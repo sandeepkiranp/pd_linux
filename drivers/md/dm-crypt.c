@@ -81,6 +81,7 @@ struct dm_crypt_io {
 	struct bio *base_bio;
 	struct bio *write_bio;
 	struct bio *write_ctx_bio;
+	struct freelist_results **freelist;
 	u8 *integrity_metadata;
 	bool integrity_metadata_from_pool;
 	struct work_struct work;
@@ -176,6 +177,7 @@ struct crypt_config {
 
 	spinlock_t write_thread_lock;
 	struct task_struct *write_thread;
+	struct task_struct *map_write_thread;
 	struct rb_root write_tree;
 
 	char *cipher_string;
@@ -2065,6 +2067,7 @@ static void crypt_io_init(struct dm_crypt_io *io, struct crypt_config *cc,
 	io->pages_head = io->pages_tail = NULL;
 	io->integrity_metadata = NULL;
 	io->integrity_metadata_from_pool = false;
+	io->freelist = NULL;
 	atomic_set(&io->io_pending, 0);
 }
 
@@ -2103,6 +2106,14 @@ static void crypt_dec_pending(struct dm_crypt_io *io)
 		mempool_free(io->integrity_metadata, &io->cc->tag_pool);
 	else
 		kfree(io->integrity_metadata);
+
+	if (io->freelist) {
+		int i;
+        	for (i = 0; i < bio_sectors(io->base_bio); i++) {
+                	kfree(io->freelist[i]);
+        	}
+        	kfree(io->freelist);
+	}
 
 	base_bio->bi_status = error;
 
@@ -2169,10 +2180,12 @@ static void crypt_endio(struct bio *clone)
 	 * free the processed pages
 	 */
 	if (rw == WRITE) {
-		crypt_free_buffer_pages(cc, clone); //TODO: check if we need to free anything here for PD Write
+		crypt_free_buffer_pages(cc, clone);
 		if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 			io_free_pages(io);
 		}
+		//update the map
+		//TODO: trigger dmcrypt_map_write() thread maybe by using a queue
 	}
 
 	error = clone->bi_status;
@@ -2189,8 +2202,6 @@ static void crypt_endio(struct bio *clone)
 				io->write_ctx_bio = io->ctx.bio_out;
 			}
 			else { // Only READ
-			       // 
-			       
 			        struct page *page;
         			struct bio_vec *bvec;
         			struct bvec_iter_all iter_all;
@@ -2328,10 +2339,16 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		struct freelist_results results[num_sectors] = {0};
 		int i, j;
 
+		io->freelist = kmalloc(bio_sectors(io->base_bio) * sizeof(io->freelist), GFP_KERNEL);
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
+			io->freelist[i] = kmalloc(num_sectors * sizeof(struct freelist_results), GFP_KERNEL);
+		}
+
+		for (i = 0; i < bio_sectors(io->base_bio); i++) {
+			int j = 0;
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
-				if(getfrom_freelist(num_sectors, results)) {
+				if(getfrom_freelist(num_sectors, io->freelist[i])) {
 					printk("Unable to find %d public sectors for hidden write\n", num_sectors);
 					//TODO: set io->error
 					return 1;
@@ -2344,8 +2361,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			}
 			//TODO: club adjacent sectors to increase performance
 
-			while(results[i].start) {
-				unsigned assigned = results[i].len * cc->sector_size;
+			while(io->freelist[i][j].start) {
+				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
 				printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
        		         	bio = crypt_alloc_buffer(io, assigned, tag_idx);
        		         	if (unlikely(!bio)) {
@@ -2355,7 +2372,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				bio->bi_opf = REQ_INTEGRITY | REQ_OP_READ;
 				bio->bi_private = NULL;
 				bio->bi_end_io = NULL;
-				bio->bi_iter.bi_sector = io->read_sector = cc->start + results[i].start; //TODO: fix io->read_sector
+				bio->bi_iter.bi_sector = io->read_sector = cc->start + io->freelist[i][j].start; //TODO: fix io->read_sector
 
 				if(prev) {
 					/* add pages of the prev bio to io and submit the prev bio */
@@ -2373,6 +2390,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
 				prev = bio;
 				tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
+				j++;
 			}
 		}
 		clone = bio;
@@ -2581,6 +2599,21 @@ static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async)
 	rb_link_node(&io->rb_node, parent, rbp);
 	rb_insert_color(&io->rb_node, &cc->write_tree);
 	spin_unlock_irqrestore(&cc->write_thread_lock, flags);
+
+}
+
+dmcrypt_map_write()
+{
+	struct dm_crypt_io *io; //TODO: How do we get the io?
+	int i, j;
+	unsigned sector = io->base_bio->bi_iter.bi_sector;
+	while(1) {	
+		if (!io->freelist)
+			continue;
+		for(i = 0; i < bio_sectors(io->base_bio); i++) {
+			map_insert(sector, io->freelist[i]);
+		}
+	}
 
 }
 
@@ -3625,6 +3658,8 @@ static void crypt_dtr(struct dm_target *ti)
 
 	if (cc->write_thread)
 		kthread_stop(cc->write_thread);
+	if (cc->map_write_thread)
+		kthread_stop(cc->map_write_thread);
 
 	if (cc->io_queue)
 		destroy_workqueue(cc->io_queue);
@@ -4312,6 +4347,14 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Couldn't spawn write thread";
 		goto bad;
 	}
+
+        cc->map_write_thread = kthread_run(dmcrypt_map_write, cc, "dmcrypt_map_write/%s", devname);
+        if (IS_ERR(cc->map_write_thread)) {
+                ret = PTR_ERR(cc->map_write_thread);
+                cc->map_write_thread = NULL;
+                ti->error = "Couldn't spawn map write thread";
+                goto bad;
+        }
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
 
