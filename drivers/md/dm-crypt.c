@@ -47,59 +47,9 @@
 #include <linux/buffer_head.h>
 
 #include "dm-audit.h"
+#include "dm-crypt.h"
 
 #define DM_MSG_PREFIX "crypt"
-
-/*
- * context holding the current state of a multi-part conversion
- */
-struct convert_context {
-	struct completion restart;
-	struct bio *bio_in;
-	struct bio *bio_out;
-	struct bvec_iter iter_in;
-	struct bvec_iter iter_out;
-	u64 cc_sector;
-	unsigned int *tag_offset;
-	atomic_t cc_pending;
-	union {
-		struct skcipher_request *req;
-		struct aead_request *req_aead;
-	} r;
-
-};
-struct io_bio_vec {
-	struct bio_vec bv;
-	struct io_bio_vec *next;
-};
-
-/*
- * per bio private data
- */
-struct dm_crypt_io {
-	struct crypt_config *cc;
-	struct bio *base_bio;
-	struct bio *write_bio;
-	struct bio *write_ctx_bio;
-	struct freelist_results **freelist;
-	u8 *integrity_metadata;
-	bool integrity_metadata_from_pool;
-	struct work_struct work;
-	struct tasklet_struct tasklet;
-
-	struct convert_context ctx;
-
-	atomic_t io_pending;
-	blk_status_t error;
-	sector_t sector;
-	sector_t write_sector;
-	sector_t read_sector;
-
-	struct rb_node rb_node;
-	unsigned long flags;
-	struct io_bio_vec *pages_head;
-	struct io_bio_vec *pages_tail;
-} CRYPTO_MINALIGN_ATTR;
 
 struct dm_crypt_request {
 	struct convert_context *ctx;
@@ -122,28 +72,6 @@ struct crypt_iv_operations {
 		    struct dm_crypt_request *dmreq);
 };
 
-struct iv_benbi_private {
-	int shift;
-};
-
-#define LMK_SEED_SIZE 64 /* hash + 0 */
-struct iv_lmk_private {
-	struct crypto_shash *hash_tfm;
-	u8 *seed;
-};
-
-#define TCW_WHITENING_SIZE 16
-struct iv_tcw_private {
-	struct crypto_shash *crc32_tfm;
-	u8 *iv_seed;
-	u8 *whitening;
-};
-
-#define ELEPHANT_MAX_KEY_SIZE 32
-struct iv_elephant_private {
-	struct crypto_skcipher *tfm;
-};
-
 /*
  * Crypt: maps a linear range of a block device
  * and encrypts / decrypts at the same time.
@@ -162,89 +90,6 @@ enum cipher_flags {
 #define	PD_READ_DURING_HIDDEN_WRITE        0x01
 #define PD_HIDDEN_OPERATION         0x02
 #define PD_READ_DURING_PUBLIC_WRITE 0x04
-
-/*
- * The fields in here must be read only after initialization.
- */
-struct crypt_config {
-	struct dm_dev *dev;
-	sector_t start;
-
-	struct percpu_counter n_allocated_pages;
-
-	struct workqueue_struct *io_queue;
-	struct workqueue_struct *crypt_queue;
-
-	spinlock_t write_thread_lock;
-	struct task_struct *write_thread;
-	struct task_struct *map_write_thread;
-	struct rb_root write_tree;
-
-	char *cipher_string;
-	char *cipher_auth;
-	char *key_string;
-
-	const struct crypt_iv_operations *iv_gen_ops;
-	union {
-		struct iv_benbi_private benbi;
-		struct iv_lmk_private lmk;
-		struct iv_tcw_private tcw;
-		struct iv_elephant_private elephant;
-	} iv_gen_private;
-	u64 iv_offset;
-	unsigned int iv_size;
-	unsigned short int sector_size;
-	unsigned char sector_shift;
-
-	union {
-		struct crypto_skcipher **tfms;
-		struct crypto_aead **tfms_aead;
-	} cipher_tfm;
-	unsigned tfms_count;
-	unsigned long cipher_flags;
-
-	/*
-	 * Layout of each crypto request:
-	 *
-	 *   struct skcipher_request
-	 *      context
-	 *      padding
-	 *   struct dm_crypt_request
-	 *      padding
-	 *   IV
-	 *
-	 * The padding is added so that dm_crypt_request and the IV are
-	 * correctly aligned.
-	 */
-	unsigned int dmreq_start;
-
-	unsigned int per_bio_data_size;
-
-	unsigned long flags;
-	unsigned int key_size;
-	unsigned int key_parts;      /* independent parts in key buffer */
-	unsigned int key_extra_size; /* additional keys length */
-	unsigned int key_mac_size;   /* MAC key size for authenc(...) */
-
-	unsigned int integrity_tag_size;
-	unsigned int integrity_iv_size;
-	unsigned int on_disk_tag_size;
-
-	/*
-	 * pool for per bio private data, crypto requests,
-	 * encryption requeusts/buffer pages and integrity tags
-	 */
-	unsigned tag_pool_max_sectors;
-	mempool_t tag_pool;
-	mempool_t req_pool;
-	mempool_t page_pool;
-
-	struct bio_set bs;
-	struct mutex bio_alloc_lock;
-
-	u8 *authenc_key; /* space for keys in authenc() format (if used) */
-	u8 key[];
-};
 
 #define MIN_IOS		64
 #define MAX_TAG_SIZE	480
@@ -399,7 +244,7 @@ unlock:
 struct freelist_results {
 	unsigned start;
 	int len;
-}
+};
 
 int getfrom_freelist(int sector_count, struct freelist_results *results)
 {
@@ -1495,7 +1340,7 @@ static int crypt_integrity_ctr(struct crypt_config *cc, struct dm_target *ti)
 #endif
 }
 
-static void crypt_convert_init(struct crypt_config *cc,
+void crypt_convert_init(struct crypt_config *cc,
 			       struct convert_context *ctx,
 			       struct bio *bio_out, struct bio *bio_in,
 			       sector_t sector, unsigned int *tag_offset)
@@ -1872,7 +1717,7 @@ static void crypt_free_req(struct crypt_config *cc, void *req, struct bio *base_
 /*
  * Encrypt / decrypt data from one bio to another one (can be the same one)
  */
-static blk_status_t crypt_convert(struct crypt_config *cc,
+blk_status_t crypt_convert(struct crypt_config *cc,
 			 struct convert_context *ctx, bool atomic, bool reset_pending)
 {
 	unsigned int *tag_offset = ctx->tag_offset;
@@ -1971,7 +1816,7 @@ static blk_status_t crypt_convert(struct crypt_config *cc,
 	return 0;
 }
 
-static void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
+void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
 
 /*
  * Generate a new unfragmented bio with the given size
@@ -1990,7 +1835,7 @@ static void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
  * non-blocking allocations without a mutex first but on failure we fallback
  * to blocking allocations with a mutex.
  */
-static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size, int integ_offset)
+struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size, int integ_offset)
 {
 	struct crypt_config *cc = io->cc;
 	struct bio *clone;
@@ -2044,7 +1889,7 @@ retry:
 	return clone;
 }
 
-static void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone)
+void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone)
 {
 	struct bio_vec *bv;
 	struct bvec_iter_all iter_all;
@@ -2336,7 +2181,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		size = num_sectors * bio_sectors(io->base_bio) * (SECTOR_SIZE << cc->sector_shift);
 		unsigned rem_size = size;
 		int tag_idx = 0;
-		struct freelist_results results[num_sectors] = {0};
 		int i, j;
 
 		io->freelist = kmalloc(bio_sectors(io->base_bio) * sizeof(io->freelist), GFP_KERNEL);
@@ -2602,7 +2446,7 @@ static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async)
 
 }
 
-dmcrypt_map_write()
+static int dmcrypt_map_write(void *data)
 {
 	struct dm_crypt_io *io; //TODO: How do we get the io?
 	int i, j;
@@ -2611,9 +2455,10 @@ dmcrypt_map_write()
 		if (!io->freelist)
 			continue;
 		for(i = 0; i < bio_sectors(io->base_bio); i++) {
-			map_insert(sector, io->freelist[i]);
+			//map_insert(sector, io->freelist[i]);
 		}
 	}
+	return 0;
 
 }
 
@@ -2848,6 +2693,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		printk("PD initiating READ during WRITE\n");
 		io->flags &= ~PD_HIDDEN_OPERATION;
 		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
+
 
 		kcryptd_queue_read(io);
 		crypt_dec_pending(io);
@@ -4436,10 +4282,14 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 		memset(io->integrity_metadata, 0, tag_len);
 	}
 
+
 	if (crypt_integrity_aead(cc))
 		io->ctx.r.req_aead = (struct aead_request *)(io + 1);
 	else
 		io->ctx.r.req = (struct skcipher_request *)(io + 1);
+
+	initialize_root(io);
+	return DM_MAPIO_SUBMITTED;
 
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))

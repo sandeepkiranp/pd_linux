@@ -53,17 +53,49 @@
  *  defined as the maximal number of pointers in any node.
  *
  */
+#include <linux/completion.h>
+#include <linux/err.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/key.h>
+#include <linux/bio.h>
+#include <linux/blkdev.h>
+#include <linux/blk-integrity.h>
+#include <linux/mempool.h>
+#include <linux/slab.h>
+#include <linux/crypto.h>
+#include <linux/workqueue.h>
+#include <linux/kthread.h>
+#include <linux/backing-dev.h>
+#include <linux/atomic.h>
+#include <linux/scatterlist.h>
+#include <linux/rbtree.h>
+#include <linux/ctype.h>
+#include <asm/page.h>
+#include <asm/unaligned.h>
+#include <crypto/hash.h>
+#include <crypto/md5.h>
+#include <crypto/algapi.h>
+#include <crypto/skcipher.h>
+#include <crypto/aead.h>
+#include <crypto/authenc.h>
+#include <linux/rtnetlink.h> /* for struct rtattr and RTA macros only */
+#include <linux/key-type.h>
+#include <keys/user-type.h>
+#include <keys/encrypted-type.h>
+#include <keys/trusted-type.h>
 
-#include <stdbool.h>
-#ifdef _WIN32
-#define bool char
-#define false 0
-#define true 1
-#endif
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <linux/device-mapper.h>
+#include <linux/fs.h>
+#include <asm/segment.h>
+#include <asm/uaccess.h>
+#include <linux/buffer_head.h>
 
+#include "dm-crypt.h"
+
+#define malloc(x) kmalloc(x, GFP_KERNEL)
+#define free(x) kfree(x)
 
 // Default order is 4.
 #define DEFAULT_ORDER 4
@@ -75,6 +107,8 @@
 
 // Constant for optional command-line input with "i" command.
 #define BUFFER_SIZE 256
+
+#define PD_HIDDEN_OPERATION         0x02
 
 // TYPES.
 
@@ -213,32 +247,31 @@ node * delete_entry(node * root, node * n, int key, void * pointer);
 node * delete(node * root, int key);
 
 
-
-
 // FUNCTION DEFINITIONS.
 
 // OUTPUT AND UTILITIES
-
-static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned size)
+// TODO: Error handling
+static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector, unsigned char *data, unsigned size)
 {
-		int ret; 
-	if( op == REQ_WRITE) {
+	int ret; 
+	int r;
+	struct crypt_config *cc = io->cc;
+	if( op == REQ_OP_WRITE) {
 		//first do a read of the required sectors data
 		int tag_offset = 0;
 		unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
 		struct bio *bio = crypt_alloc_buffer(io, len, 0);
-		bio->bi_opf = REQ_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
+		bio->bi_opf = REQ_OP_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
 		bio->bi_iter.bi_sector = sector;
 		ret = submit_bio_wait(bio);
 
 		// decrypt the data read
 		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
-		r = crypt_convert(cc, &io->ctx,
-				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+		r = crypt_convert(cc, &io->ctx, false, true);
 
 		// encrypt the hidden input data
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
-		bio->bi_opf = REQ_WRITE;
+		bio->bi_opf = REQ_OP_WRITE;
 		struct bvec_iter iter_out = hbio->bi_iter;
 		unsigned offset = 0;
 		while (iter_out.bi_size) {
@@ -252,8 +285,7 @@ static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned si
 
 		io->flags |= PD_HIDDEN_OPERATION;
 		crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
-		r = crypt_convert(cc, &io->ctx,
-				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+		r = crypt_convert(cc, &io->ctx, false, true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
 
@@ -270,8 +302,7 @@ static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned si
 		}
 		// encrypt and write the whole thing. TODO check if crypt_convert takes IV from integrity_metadata here.
 		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
-		r = crypt_convert(cc, &io->ctx,
-				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+		r = crypt_convert(cc, &io->ctx, false, true);
 		bio->bi_opf = op | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
 		bio->bi_iter.bi_sector = sector;
 		ret = submit_bio_wait(bio);
@@ -281,12 +312,12 @@ static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned si
 		crypt_free_buffer_pages(cc, hbio);
 		bio_put(hbio);
 	}
-	if( op == REQ_READ) {
+	if( op == REQ_OP_READ) {
 		// Read equivalent data sectors along with integrity metadata
 		int tag_offset = 0;
 		unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
 		struct bio *bio = crypt_alloc_buffer(io, len, 0);
-		bio->bi_opf = REQ_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
+		bio->bi_opf = REQ_OP_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
 		bio->bi_iter.bi_sector = sector;
 		ret = submit_bio_wait(bio);
 
@@ -304,8 +335,7 @@ static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned si
 		}
 		io->flags |= PD_HIDDEN_OPERATION;
 		crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
-		r = crypt_convert(cc, &io->ctx,
-				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+		r = crypt_convert(cc, &io->ctx, false, true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
 		// copy decrypted data to output
@@ -330,9 +360,9 @@ static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned si
 /* Copyright and license notice to user at startup. 
  */
 void license_notice(void) {
-	printf("bpt version %s -- Copyright (c) 2018  Amittai Aviram "
+	printk("bpt version %s -- Copyright (c) 2018  Amittai Aviram "
 			"http://www.amittai.com\n", Version);
-	printf("This program comes with ABSOLUTELY NO WARRANTY.\n"
+	printk("This program comes with ABSOLUTELY NO WARRANTY.\n"
 			"This is free software, and you are welcome to redistribute it\n"
 			"under certain conditions.\n"
 			"Please see the headnote in the source code for details.\n");
@@ -342,14 +372,14 @@ void license_notice(void) {
 /* First message to the user.
  */
 void usage_1(void) {
-	printf("B+ Tree of Order %d.\n", order);
-	printf("Following Silberschatz, Korth, Sidarshan, Database Concepts, "
+	printk("B+ Tree of Order %d.\n", order);
+	printk("Following Silberschatz, Korth, Sidarshan, Database Concepts, "
 		   "5th ed.\n\n"
 		   "To build a B+ tree of a different order, start again and enter "
 		   "the order\n"
 		   "as an integer argument:  bpt <order>  ");
-	printf("(%d <= order <= %d).\n", MIN_ORDER, MAX_ORDER);
-	printf("To start with input from a file of newline-delimited integers, \n"
+	printk("(%d <= order <= %d).\n", MIN_ORDER, MAX_ORDER);
+	printk("To start with input from a file of newline-delimited integers, \n"
 		   "start again and enter the order followed by the filename:\n"
 		   "bpt <order> <inputfile> .\n");
 }
@@ -358,7 +388,7 @@ void usage_1(void) {
 /* Second message to the user.
  */
 void usage_2(void) {
-	printf("Enter any of the following commands after the prompt > :\n"
+	printk("Enter any of the following commands after the prompt > :\n"
 	"\ti <k>  -- Insert <k> (an integer) as both key and value).\n"
 	"\ti <k> <v> -- Insert the value <v> (an integer) as the value of key <k> (an integer).\n"
 	"\tf <k>  -- Find the value under key <k>.\n"
@@ -381,8 +411,8 @@ void usage_2(void) {
 /* Brief usage note.
  */
 void usage_3(void) {
-	printf("Usage: ./bpt [<order>]\n");
-	printf("\twhere %d <= order <= %d .\n", MIN_ORDER, MAX_ORDER);
+	printk("Usage: ./bpt [<order>]\n");
+	printk("\twhere %d <= order <= %d .\n", MIN_ORDER, MAX_ORDER);
 }
 
 
@@ -423,7 +453,7 @@ node * dequeue(void) {
  */
 void print_leaves(node * const root) {
 	if (root == NULL) {
-		printf("Empty tree.\n");
+		printk("Empty tree.\n");
 		return;
 	}
 	int i;
@@ -433,19 +463,19 @@ void print_leaves(node * const root) {
 	while (true) {
 		for (i = 0; i < c->num_keys; i++) {
 			if (verbose_output)
-				printf("%p ", c->pointers[i]);
-			printf("%d ", c->keys[i]);
+				printk("%p ", c->pointers[i]);
+			printk("%d ", c->keys[i]);
 		}
 		if (verbose_output)
-			printf("%p ", c->pointers[order - 1]);
+			printk("%p ", c->pointers[order - 1]);
 		if (c->pointers[order - 1] != NULL) {
-			printf(" | ");
+			printk(" | ");
 			c = c->pointers[order - 1];
 		}
 		else
 			break;
 	}
-	printf("\n");
+	printk("\n");
 }
 
 
@@ -495,7 +525,7 @@ void print_tree(node * const root) {
 	int new_rank = 0;
 
 	if (root == NULL) {
-		printf("Empty tree.\n");
+		printk("Empty tree.\n");
 		return;
 	}
 	queue = NULL;
@@ -506,28 +536,28 @@ void print_tree(node * const root) {
 			new_rank = path_to_root(root, n);
 			if (new_rank != rank) {
 				rank = new_rank;
-				printf("\n");
+				printk("\n");
 			}
 		}
 		if (verbose_output) 
-			printf("(%p)", n);
+			printk("(%p)", n);
 		for (i = 0; i < n->num_keys; i++) {
 			if (verbose_output)
-				printf("%p ", n->pointers[i]);
-			printf("%d ", n->keys[i]);
+				printk("%p ", n->pointers[i]);
+			printk("%d ", n->keys[i]);
 		}
 		if (!n->is_leaf)
 			for (i = 0; i <= n->num_keys; i++)
 				enqueue(n->pointers[i]);
 		if (verbose_output) {
 			if (n->is_leaf) 
-				printf("%p ", n->pointers[order - 1]);
+				printk("%p ", n->pointers[order - 1]);
 			else
-				printf("%p ", n->pointers[n->num_keys]);
+				printk("%p ", n->pointers[n->num_keys]);
 		}
-		printf("| ");
+		printk("| ");
 	}
-	printf("\n");
+	printk("\n");
 }
 
 
@@ -538,9 +568,9 @@ void find_and_print(node * const root, int key, bool verbose) {
 	node * leaf = NULL;
 	record * r = find(root, key, verbose, NULL);
 	if (r == NULL)
-		printf("Record not found under key %d.\n", key);
+		printk("Record not found under key %d.\n", key);
 	else 
-		printf("Record at %p -- key %d, value %d.\n",
+		printk("Record at %p -- key %d, value %d.\n",
 				r, key, r->value);
 }
 
@@ -557,10 +587,10 @@ void find_and_print_range(node * const root, int key_start, int key_end,
 	int num_found = find_range(root, key_start, key_end, verbose,
 			returned_keys, returned_pointers);
 	if (!num_found)
-		printf("None found.\n");
+		printk("None found.\n");
 	else {
 		for (i = 0; i < num_found; i++)
-			printf("Key: %d   Location: %p  Value: %d\n",
+			printk("Key: %d   Location: %p  Value: %d\n",
 					returned_keys[i],
 					returned_pointers[i],
 					((record *)
@@ -670,8 +700,7 @@ int cut(int length) {
 record * make_record(int value) {
 	record * new_record = (record *)malloc(sizeof(record));
 	if (new_record == NULL) {
-		perror("Record creation.");
-		exit(EXIT_FAILURE);
+		printk("Record creation.");
 	}
 	else {
 		new_record->value = value;
@@ -687,18 +716,15 @@ node * make_node(void) {
 	node * new_node;
 	new_node = malloc(sizeof(node));
 	if (new_node == NULL) {
-		perror("Node creation.");
-		exit(EXIT_FAILURE);
+		printk("Node creation.");
 	}
 	new_node->keys = malloc((order - 1) * sizeof(int));
 	if (new_node->keys == NULL) {
-		perror("New node keys array.");
-		exit(EXIT_FAILURE);
+		printk("New node keys array.");
 	}
 	new_node->pointers = malloc(order * sizeof(void *));
 	if (new_node->pointers == NULL) {
-		perror("New node pointers array.");
-		exit(EXIT_FAILURE);
+		printk("New node pointers array.");
 	}
 	new_node->is_leaf = false;
 	new_node->num_keys = 0;
@@ -769,14 +795,12 @@ node * insert_into_leaf_after_splitting(node * root, node * leaf, int key, recor
 
 	temp_keys = malloc(order * sizeof(int));
 	if (temp_keys == NULL) {
-		perror("Temporary keys array.");
-		exit(EXIT_FAILURE);
+		printk("Temporary keys array.");
 	}
 
 	temp_pointers = malloc(order * sizeof(void *));
 	if (temp_pointers == NULL) {
-		perror("Temporary pointers array.");
-		exit(EXIT_FAILURE);
+		printk("Temporary pointers array.");
 	}
 
 	insertion_index = 0;
@@ -868,13 +892,11 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 
 	temp_pointers = malloc((order + 1) * sizeof(node *));
 	if (temp_pointers == NULL) {
-		perror("Temporary pointers array for splitting nodes.");
-		exit(EXIT_FAILURE);
+		printk("Temporary pointers array for splitting nodes.");
 	}
 	temp_keys = malloc(order * sizeof(int));
 	if (temp_keys == NULL) {
-		perror("Temporary keys array for splitting nodes.");
-		exit(EXIT_FAILURE);
+		printk("Temporary keys array for splitting nodes.");
 	}
 
 	for (i = 0, j = 0; i < old_node->num_keys + 1; i++, j++) {
@@ -1090,9 +1112,10 @@ int get_neighbor_index(node * n) {
 			return i - 1;
 
 	// Error state.
-	printf("Search for nonexistent pointer to node in parent.\n");
-	printf("Node:  %#lx\n", (unsigned long)n);
-	exit(EXIT_FAILURE);
+	printk("Search for nonexistent pointer to node in parent.\n");
+	printk("Node:  %#lx\n", (unsigned long)n);
+
+	return 9999;
 }
 
 
@@ -1450,7 +1473,7 @@ node * destroy_tree(node * root) {
 	destroy_tree_nodes(root);
 	return NULL;
 }
-
+/*
 map_insert(unsigned sector, struct freelist_results *res)
 {
 	insert(root, );
@@ -1463,7 +1486,14 @@ map_ctr(crypt_config *cc)
 	
 
 }
+*/
+void initialize_root(struct dm_crypt_io *io)
+{
+        unsigned char root_data[16 * 10] = {0};
+        rdwr_sector_metadata(io, REQ_OP_READ, 0, root_data, 160);
+}
 
+/*
 // MAIN
 
 int main(int argc, char ** argv) {
@@ -1480,7 +1510,7 @@ int main(int argc, char ** argv) {
 	if (argc > 1) {
 		order = atoi(argv[1]);
 		if (order < MIN_ORDER || order > MAX_ORDER) {
-			fprintf(stderr, "Invalid order: %d .\n\n", order);
+			fprintk(stderr, "Invalid order: %d .\n\n", order);
 			usage_3();
 			exit(EXIT_FAILURE);
 		}
@@ -1496,7 +1526,7 @@ int main(int argc, char ** argv) {
 		input_file = argv[2];
 		fp = fopen(input_file, "r");
 		if (fp == NULL) {
-			perror("Failure to open input file.");
+			printk("Failure to open input file.");
 			exit(EXIT_FAILURE);
 		}
 		while (!feof(fp)) {
@@ -1508,7 +1538,7 @@ int main(int argc, char ** argv) {
 		return EXIT_SUCCESS;
 	}
 
-	printf("> ");
+	printk("> ");
 	char buffer[BUFFER_SIZE];
 	int count = 0;
 	bool line_consumed = false;
@@ -1567,9 +1597,10 @@ int main(int argc, char ** argv) {
 		}
 		if (!line_consumed)
 		   while (getchar() != (int)'\n');
-		printf("> ");
+		printk("> ");
 	}
-	printf("\n");
+	printk("\n");
 
 	return EXIT_SUCCESS;
 }
+*/
