@@ -221,102 +221,110 @@ node * delete(node * root, int key);
 
 static int rdwr_sector_metadata(int op, sector_t sector, char *data, unsigned size)
 {
-        int ret; 
+		int ret; 
 	if( op == REQ_WRITE) {
-		//first do a read of the sectors data
+		//first do a read of the required sectors data
 		int tag_offset = 0;
 		unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
 		struct bio *bio = crypt_alloc_buffer(io, len, 0);
 		bio->bi_opf = REQ_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
-	        bio->bi_iter.bi_sector = sector;
-        	ret = submit_bio_wait(bio);
+		bio->bi_iter.bi_sector = sector;
+		ret = submit_bio_wait(bio);
 
 		// decrypt the data read
-                crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
-                r = crypt_convert(cc, &io->ctx,
-                                  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
+		r = crypt_convert(cc, &io->ctx,
+				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
 
-		// encrypt the input data	
-                struct bio *hbio = crypt_alloc_buffer(io, size, 0);
-                bio->bi_opf = REQ_WRITE | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
-                struct bvec_iter iter_out = hbio->bi_iter;
-                unsigned offset = 0;
-                while (iter_out.bi_size) {
-                        struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
-                        char *buffer = page_to_virt(bv_out.bv_page);
+		// encrypt the hidden input data
+		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
+		bio->bi_opf = REQ_WRITE;
+		struct bvec_iter iter_out = hbio->bi_iter;
+		unsigned offset = 0;
+		while (iter_out.bi_size) {
+			struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
+			char *buffer = page_to_virt(bv_out.bv_page);
 
-                        memcpy(buffer + bv_out.bv_offset, data + offset, cc->on_disk_tag_size);
-                        bio_advance_iter(hbio, &iter_out, cc->on_disk_tag_size);
-                        offset += cc->on_disk_tag_size;
-                }
+			memcpy(buffer + bv_out.bv_offset, data + offset, size);
+			bio_advance_iter(hbio, &iter_out, size);
+			offset += size;
+		}
 
 		io->flags |= PD_HIDDEN_OPERATION;
-                crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
-                r = crypt_convert(cc, &io->ctx,
-                                  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+		crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
+		r = crypt_convert(cc, &io->ctx,
+				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
 
-                // copy encrypted input data to integrity metadata
-                iter_out = hbio->bi_iter;
-                offset = 0;
-                while (iter_out.bi_size) {
-                        struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
-                        char *buffer = page_to_virt(bv_out.bv_page);
+		// copy encrypted input data to integrity metadata
+		iter_out = hbio->bi_iter;
+		offset = 0;
+		while (iter_out.bi_size) {
+			struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
+			char *buffer = page_to_virt(bv_out.bv_page);
 
-                        memcpy(io->integrity_metadata + offset, buffer + bv_out.bv_offset, cc->on_disk_tag_size);
-                        bio_advance_iter(hbio, &iter_out, cc->on_disk_tag_size);
-                        offset += cc->on_disk_tag_size;
-                }
-		// encrypt and write the whole thing
-                crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
-                r = crypt_convert(cc, &io->ctx,
-                                  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+			memcpy(io->integrity_metadata + offset, buffer + bv_out.bv_offset, size);
+			bio_advance_iter(hbio, &iter_out, size);
+			offset += size;
+		}
+		// encrypt and write the whole thing. TODO check if crypt_convert takes IV from integrity_metadata here.
+		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
+		r = crypt_convert(cc, &io->ctx,
+				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
 		bio->bi_opf = op | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
-        	bio->bi_iter.bi_sector = sector;
-	        ret = submit_bio_wait(bio);
+		bio->bi_iter.bi_sector = sector;
+		ret = submit_bio_wait(bio);
+
+		crypt_free_buffer_pages(cc, bio);
+		bio_put(bio);
+		crypt_free_buffer_pages(cc, hbio);
+		bio_put(hbio);
 	}
-        if( op == REQ_READ) {
-                int tag_offset = 0;
-                unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
-                struct bio *bio = crypt_alloc_buffer(io, len, 0);
-                bio->bi_opf = REQ_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
-                bio->bi_iter.bi_sector = sector;
-                ret = submit_bio_wait(bio);
+	if( op == REQ_READ) {
+		// Read equivalent data sectors along with integrity metadata
+		int tag_offset = 0;
+		unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
+		struct bio *bio = crypt_alloc_buffer(io, len, 0);
+		bio->bi_opf = REQ_READ | REQ_SYNC | REQ_META | REQ_PRIO, GFP_NOIO;
+		bio->bi_iter.bi_sector = sector;
+		ret = submit_bio_wait(bio);
 
+		//decrypt the integrity metadata
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
-                struct bvec_iter iter_out = hbio->bi_iter;
-                unsigned offset = 0;
-                while (iter_out.bi_size) {
-                        struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
-                        char *buffer = page_to_virt(bv_out.bv_page);
+		struct bvec_iter iter_out = hbio->bi_iter;
+		unsigned offset = 0;
+		while (iter_out.bi_size) {
+			struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
+			char *buffer = page_to_virt(bv_out.bv_page);
 
-                        memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, cc->on_disk_tag_size);
-                        bio_advance_iter(hbio, &iter_out, cc->on_disk_tag_size);
-                        offset += cc->on_disk_tag_size;
-                }
-                io->flags |= PD_HIDDEN_OPERATION;
-                crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
-                r = crypt_convert(cc, &io->ctx,
-                                  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+			memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, size);
+			bio_advance_iter(hbio, &iter_out, size);
+			offset += size;
+		}
+		io->flags |= PD_HIDDEN_OPERATION;
+		crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
+		r = crypt_convert(cc, &io->ctx,
+				  test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
 
-                io->flags &= ~PD_HIDDEN_OPERATION;
-                iter_out = hbio->bi_iter;
-                offset = 0;
-                while (iter_out.bi_size) {
-                        struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
-                        char *buffer = page_to_virt(bv_out.bv_page);
+		io->flags &= ~PD_HIDDEN_OPERATION;
+		// copy decrypted data to output
+		iter_out = hbio->bi_iter;
+		offset = 0;
+		while (iter_out.bi_size) {
+			struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
+			char *buffer = page_to_virt(bv_out.bv_page);
 
-                        memcpy(data + offset, buffer + bv_out.bv_offset, cc->on_disk_tag_size);
-                        bio_advance_iter(hbio, &iter_out, cc->on_disk_tag_size);
-                        offset += cc->on_disk_tag_size;
-                }
-        }
-
-	crypt_free_buffer_pages(cc, bio);
-        bio_put(bio);
-
-        return ret; 
+			memcpy(data + offset, buffer + bv_out.bv_offset, size);
+			bio_advance_iter(hbio, &iter_out, size);
+			offset += size;
+		}
+                crypt_free_buffer_pages(cc, bio);
+                bio_put(bio);
+                crypt_free_buffer_pages(cc, hbio);
+                bio_put(hbio);
+	}
+	return ret; 
 }
 
 /* Copyright and license notice to user at startup. 
