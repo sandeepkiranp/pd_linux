@@ -255,7 +255,6 @@ static void map_endio(struct bio *clone)
         struct dm_crypt_io *io = clone->bi_private;
         struct crypt_config *cc = io->cc;
         unsigned rw = bio_data_dir(clone);
-        blk_status_t error;
 
         printk("Inside map_endio IO address %p, IO flags %d, size= %d, starting sector = %d, direction %s\n",
                         io, io->flags, clone->bi_iter.bi_size, clone->bi_iter.bi_sector, (rw == WRITE) ? "WRITE" : "READ");
@@ -268,19 +267,27 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 	int r;
 	struct crypt_config *cc = io->cc;
 	printk("rdwr_sector_metadata, %s, sector %d, size %d\n", (op == REQ_OP_WRITE) ? "WRITE" : "READ", sector, size);
-	/*
 	if( op == REQ_OP_WRITE) {
 		//first do a read of the required sectors data
-		int tag_offset = 0;
-		unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
-		struct bio *bio = crypt_alloc_buffer(io, len, 0);
-		bio->bi_opf = REQ_OP_READ | REQ_SYNC;
-		bio->bi_iter.bi_sector = sector;
-		ret = submit_bio_wait(bio);
+                int tag_offset = 0;
+                unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
+                struct bio *bio = crypt_alloc_buffer(io, len, 0);
+                bio->bi_private = io;
+                bio->bi_end_io = map_endio;
+                bio->bi_opf = REQ_OP_READ | REQ_INTEGRITY;
+                bio->bi_iter.bi_sector = sector;
+                crypt_inc_pending(io);
+                printk("rdrw_sector before submit_bio_remap\n");
+                dm_submit_bio_remap(io->base_bio, bio);
+                printk("rdrw_sector after submit_bio_remap\n");
+                wait_for_completion(&io->map_complete);
+                reinit_completion(&io->map_complete);
+                printk("rdrw_sector after reinit_completionn");
 
 		// decrypt the data read
 		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx, false, true);
+                printk("rdrw_sector after public read");
 
 		// encrypt the hidden input data
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
@@ -301,6 +308,7 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		r = crypt_convert(cc, &io->ctx, false, true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
+                printk("rdrw_sector after hidden encryption");
 
 		// copy encrypted input data to integrity metadata
 		iter_out = hbio->bi_iter;
@@ -314,18 +322,28 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 			offset += size;
 		}
 		// encrypt and write the whole thing. TODO check if crypt_convert takes IV from integrity_metadata here.
+		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
 		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx, false, true);
-		bio->bi_opf = op | REQ_SYNC;
-		bio->bi_iter.bi_sector = sector;
-		ret = submit_bio_wait(bio);
+		io->flags &= ~PD_READ_DURING_HIDDEN_WRITE;
+                printk("rdrw_sector after public encryption");
+                bio->bi_private = io;
+                bio->bi_end_io = map_endio;
+                bio->bi_opf = REQ_OP_WRITE | REQ_INTEGRITY;
+                bio->bi_iter.bi_sector = sector;
+                printk("rdrw_sector before submit_bio_remap\n");
+                dm_submit_bio_remap(io->base_bio, bio);
+                printk("rdrw_sector after submit_bio_remap\n");
+                wait_for_completion(&io->map_complete);
+                reinit_completion(&io->map_complete);
+                printk("rdrw_sector after reinit_completionn");
 
 		crypt_free_buffer_pages(cc, bio);
 		bio_put(bio);
 		crypt_free_buffer_pages(cc, hbio);
 		bio_put(hbio);
+		crypt_dec_pending(io);
 	}
-	*/
 	if( op == REQ_OP_READ) {
 		// Read equivalent data sectors along with integrity metadata
 		int tag_offset = 0;
@@ -343,8 +361,6 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		reinit_completion(&io->map_complete);
 		printk("rdrw_sector after reinit_completionn");
 
-		return ret;
-
 		//decrypt the integrity metadata
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
 		struct bvec_iter iter_out = hbio->bi_iter;
@@ -357,11 +373,14 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 			bio_advance_iter(hbio, &iter_out, size);
 			offset += size;
 		}
+		hbio->bi_opf = REQ_OP_READ;
 		io->flags |= PD_HIDDEN_OPERATION;
+		printk("rdrw_sector before crypt_convert");
 		crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx, false, true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
+		printk("rdrw_sector after crypt_convert");
 		// copy decrypted data to output
 		iter_out = hbio->bi_iter;
 		offset = 0;
@@ -373,10 +392,12 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 			bio_advance_iter(hbio, &iter_out, size);
 			offset += size;
 		}
+		printk("rdrw_sector node data present in output");
                 crypt_free_buffer_pages(cc, bio);
                 bio_put(bio);
                 crypt_free_buffer_pages(cc, hbio);
                 bio_put(hbio);
+		crypt_dec_pending(io);
 	}
 	return ret; 
 }
@@ -1514,7 +1535,10 @@ map_ctr(crypt_config *cc)
 void initialize_root(struct dm_crypt_io *io)
 {
         unsigned char root_data[16 * 10] = {0};
-        rdwr_sector_metadata(io, REQ_OP_READ, 10, root_data, 160);
+        unsigned char rd_root_data[16 * 10];
+        rdwr_sector_metadata(io, REQ_OP_WRITE, 10, root_data, 160);
+        rdwr_sector_metadata(io, REQ_OP_READ, 10, rd_root_data, 160);
+	printk("initialize_root memcmp %d\n", memcmp(root_data, rd_root_data, 16 * 10));
 }
 
 /*
