@@ -30,6 +30,7 @@ struct dm_crypt_io {
         struct bio *write_bio;
         struct bio *write_ctx_bio;
         struct freelist_results **freelist;
+	struct completion map_complete;
         u8 *integrity_metadata;
         bool integrity_metadata_from_pool;
         struct work_struct work;
@@ -163,5 +164,9 @@ void crypt_convert_init(struct crypt_config *cc,
 blk_status_t crypt_convert(struct crypt_config *cc,
                         struct convert_context *ctx, bool atomic, bool reset_pending);
 void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
+
+void crypt_inc_pending(struct dm_crypt_io *io);
+
+void crypt_dec_pending(struct dm_crypt_io *io);
 
 void initialize_root(struct dm_crypt_io *io);
