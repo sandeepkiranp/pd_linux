@@ -289,7 +289,7 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 
 		// encrypt the hidden input data
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
-		bio->bi_opf = REQ_OP_WRITE;
+		hbio->bi_opf = REQ_OP_WRITE;
 		struct bvec_iter iter_out = hbio->bi_iter;
 		unsigned offset = 0;
 		while (iter_out.bi_size) {
@@ -321,6 +321,7 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		}
 		// encrypt and write the whole thing. TODO check if crypt_convert takes IV from integrity_metadata here.
 		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
+		tag_offset = 0;
                 iter_out = bio->bi_iter;
                 bio_reset(bio, cc->dev->bdev, REQ_OP_WRITE|REQ_INTEGRITY);
                 bio->bi_iter = iter_out;
@@ -1539,10 +1540,12 @@ map_ctr(crypt_config *cc)
 */
 void initialize_root(struct dm_crypt_io *io)
 {
-        unsigned char root_data[16 * 10] = {0};
+        unsigned char root_data[16 * 10] = {10};
         unsigned char rd_root_data[16 * 10];
+	crypt_inc_pending(io);
         rdwr_sector_metadata(io, REQ_OP_WRITE, 10, root_data, 160);
         rdwr_sector_metadata(io, REQ_OP_READ, 10, rd_root_data, 160);
+	crypt_dec_pending(io);
 	printk("initialize_root memcmp %d\n", memcmp(root_data, rd_root_data, 16 * 10));
 }
 
