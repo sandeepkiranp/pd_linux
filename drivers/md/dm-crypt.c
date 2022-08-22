@@ -87,10 +87,6 @@ enum cipher_flags {
 	CRYPT_ENCRYPT_PREPROCESS,	/* Must preprocess data for encryption (elephant) */
 };
 
-#define	PD_READ_DURING_HIDDEN_WRITE        0x01
-#define PD_HIDDEN_OPERATION         0x02
-#define PD_READ_DURING_PUBLIC_WRITE 0x04
-
 #define MIN_IOS		64
 #define MAX_TAG_SIZE	480
 #define POOL_ENTRY_SIZE	512
@@ -1259,7 +1255,7 @@ static struct scatterlist *crypt_get_sg_data(struct crypt_config *cc,
 	return sg;
 }
 
-static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int offset)
+int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int offset)
 {
 	struct bio_integrity_payload *bip;
 	unsigned int tag_len;
@@ -2566,6 +2562,10 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
                         bio_put(bio);
                 }
+		// if we use the same bio for read and write, it somehow results in crash in submit_bio_noacct
+		// Therefore, we are resetting the bio before submitting again
+		// io->base_bio here is the temporary bio and not the actual base_bio
+		// actual base_bio is in io->write_bio
 		struct bvec_iter iter = io->base_bio->bi_iter;
 		bio_reset(io->base_bio, cc->dev->bdev, REQ_OP_WRITE|REQ_INTEGRITY);
 		io->base_bio->bi_iter = iter;

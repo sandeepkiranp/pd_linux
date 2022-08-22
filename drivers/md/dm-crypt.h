@@ -1,3 +1,7 @@
+#define PD_READ_DURING_HIDDEN_WRITE        0x01
+#define PD_HIDDEN_OPERATION         0x02
+#define PD_READ_DURING_PUBLIC_WRITE 0x04
+
 /*
  * context holding the current state of a multi-part conversion
  */
@@ -168,5 +172,7 @@ void crypt_free_buffer_pages(struct crypt_config *cc, struct bio *clone);
 void crypt_inc_pending(struct dm_crypt_io *io);
 
 void crypt_dec_pending(struct dm_crypt_io *io);
+
+int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int offset);
 
 void initialize_root(struct dm_crypt_io *io);

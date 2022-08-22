@@ -108,8 +108,6 @@
 // Constant for optional command-line input with "i" command.
 #define BUFFER_SIZE 256
 
-#define PD_HIDDEN_OPERATION         0x02
-
 // TYPES.
 
 /* Type representing the record
@@ -323,15 +321,22 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		}
 		// encrypt and write the whole thing. TODO check if crypt_convert takes IV from integrity_metadata here.
 		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
-		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
-		r = crypt_convert(cc, &io->ctx, false, true);
-		io->flags &= ~PD_READ_DURING_HIDDEN_WRITE;
-                printk("rdrw_sector after public encryption");
+                iter_out = bio->bi_iter;
+                bio_reset(bio, cc->dev->bdev, REQ_OP_WRITE|REQ_INTEGRITY);
+                bio->bi_iter = iter_out;
                 bio->bi_private = io;
                 bio->bi_end_io = map_endio;
+                /* Allocate space for integrity tags */
+                if (dm_crypt_integrity_io_alloc(io, bio, 0)) {
+                         printk("rdrw_sector dm_crypt_integrity_io_alloc failed!\n");
+                         //TODO: handle this gracefully
+                }
+
+		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
+		r = crypt_convert(cc, &io->ctx, false, true);
+                printk("rdrw_sector after public encryption");
+		io->flags &= ~PD_READ_DURING_HIDDEN_WRITE;
                 bio->bi_opf = REQ_OP_WRITE | REQ_INTEGRITY;
-                bio->bi_iter.bi_sector = sector;
-                printk("rdrw_sector before submit_bio_remap\n");
                 dm_submit_bio_remap(io->base_bio, bio);
                 printk("rdrw_sector after submit_bio_remap\n");
                 wait_for_completion(&io->map_complete);
