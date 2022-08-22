@@ -1577,9 +1577,8 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 	sg_set_page(sg_out, bv_out.bv_page, data_len, bv_out.bv_offset);
 
 	if (cc->iv_gen_ops) {
-		
-		if((io->flags & PD_READ_DURING_PUBLIC_WRITE) && (io->flags & PD_HIDDEN_OPERATION)) {
-		    //kludge to get it working
+		if(io->flags & PD_HIDDEN_OPERATION) {
+		    //kludge to get it working. For all hidden operations use sector number as IV
                     r = crypt_iv_plain_gen(cc, org_iv, dmreq);
                     if (r < 0)
                         return r;
@@ -2283,7 +2282,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 static void kcryptd_io_read_map(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
-	printk("=================Inside kcryptd_io_read_map %p\n", work);
+	printk("Inside kcryptd_io_read_map %p\n", work);
 	initialize_root(io);
 }
 
