@@ -2024,9 +2024,12 @@ static void crypt_endio(struct bio *clone)
 		crypt_free_buffer_pages(cc, clone);
 		if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 			io_free_pages(io);
+			//bio_put(clone);
+			//update the map
+                	//INIT_WORK(&io->work, kcryptd_io_rdwr_map);
+                	//queue_work(cc->map_queue, &io->work);
+			//return;
 		}
-		//update the map
-		//TODO: trigger dmcrypt_map_write() thread maybe by using a queue
 	}
 
 	error = clone->bi_status;
@@ -2201,7 +2204,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			}
 			//TODO: club adjacent sectors to increase performance
 
-			while(io->freelist[i][j].start) {
+			while(j < num_sectors && io->freelist[i][j].start) {
 				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
 				printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
        		         	bio = crypt_alloc_buffer(io, assigned, tag_idx);
@@ -2215,7 +2218,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				bio->bi_iter.bi_sector = io->read_sector = cc->start + io->freelist[i][j].start; //TODO: fix io->read_sector
 
 				if(prev) {
-					/* add pages of the prev bio to io and submit the prev bio */
+					/* save pages of the prev bio in io and submit the prev bio */
 		        		struct bio_vec *bv;
 				        struct bvec_iter_all iter_all;
 
@@ -2275,11 +2278,22 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 }
 
 
-static void kcryptd_io_read_map(struct work_struct *work)
+static void kcryptd_io_rdwr_map(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
-	printk("Inside kcryptd_io_read_map %p\n", work);
-	initialize_root(io);
+        int i, j;
+	printk("Inside kcryptd_io_rdwr_map %p\n", work);
+
+	//initialize_root(io);
+
+        unsigned sector = io->base_bio->bi_iter.bi_sector;
+        if (!io->freelist)
+            continue;
+        for(i = 0; i < bio_sectors(io->base_bio); i++) {
+            //map_insert(sector, io->freelist[i]);
+        }
+        return 0;
+
 }
 
 static void kcryptd_io_read_work(struct work_struct *work)
@@ -2447,22 +2461,6 @@ static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async)
 	rb_link_node(&io->rb_node, parent, rbp);
 	rb_insert_color(&io->rb_node, &cc->write_tree);
 	spin_unlock_irqrestore(&cc->write_thread_lock, flags);
-
-}
-
-static int dmcrypt_map_write(void *data)
-{
-	struct dm_crypt_io *io; //TODO: How do we get the io?
-	int i, j;
-	unsigned sector = io->base_bio->bi_iter.bi_sector;
-	while(1) {	
-		if (!io->freelist)
-			continue;
-		for(i = 0; i < bio_sectors(io->base_bio); i++) {
-			//map_insert(sector, io->freelist[i]);
-		}
-	}
-	return 0;
 
 }
 
@@ -2811,6 +2809,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (atomic_dec_and_test(&io->ctx.cc_pending))
 		kcryptd_crypt_read_done(io);
 
+	// Hidden read read only.
 	if (io->flags & PD_HIDDEN_OPERATION && !(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
 		unsigned total_copied = 0;
 		/* restore base bio */
@@ -2873,7 +2872,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 				printk("No hidden data present (magic %02hhx), generating random IV\n", buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG]);
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
-				//addto_freelist(sector);
+				addto_freelist(sector);
 			}
 			bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
 			sector++;
@@ -3512,13 +3511,12 @@ static void crypt_dtr(struct dm_target *ti)
 
 	if (cc->write_thread)
 		kthread_stop(cc->write_thread);
-	if (cc->map_write_thread)
-		kthread_stop(cc->map_write_thread);
-
 	if (cc->io_queue)
 		destroy_workqueue(cc->io_queue);
 	if (cc->crypt_queue)
 		destroy_workqueue(cc->crypt_queue);
+	if (cc->map_queue)
+		destroy_workqueue(cc->map_queue);
 
 	file_close(bio_file);
 
@@ -3995,6 +3993,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int ret, i;
 	size_t iv_size_padding, additional_req_size;
 	char dummy;
+	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
 	printk("device name %s, begin %d, len %d\n", devname, ti->begin, ti->len);
 	if (argc < 5) {
@@ -4191,6 +4190,13 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
+        cc->map_queue = alloc_workqueue("kcryptd_map/%s", WQ_MEM_RECLAIM, 1, devname);
+        if (!cc->map_queue) {
+                ti->error = "Couldn't create kcryptd map queue";
+                goto bad;
+        }
+
+
 	spin_lock_init(&cc->write_thread_lock);
 	cc->write_tree = RB_ROOT;
 
@@ -4201,17 +4207,10 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Couldn't spawn write thread";
 		goto bad;
 	}
-/*
-        cc->map_write_thread = kthread_run(dmcrypt_map_write, cc, "dmcrypt_map_write/%s", devname);
-        if (IS_ERR(cc->map_write_thread)) {
-                ret = PTR_ERR(cc->map_write_thread);
-                cc->map_write_thread = NULL;
-                ti->error = "Couldn't spawn map write thread";
-                goto bad;
-        }
 
-*/
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
+
+	//map_ctr(num_sectors);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
@@ -4297,16 +4296,18 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	else
 		io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
+/*
 	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-	        INIT_WORK(&io->work, kcryptd_io_read_map);
-        	queue_work(cc->io_queue, &io->work);
+	        INIT_WORK(&io->work, kcryptd_io_rdwr_map);
+        	queue_work(cc->map_queue, &io->work);
 		return DM_MAPIO_SUBMITTED;
 
 	}
-	else {
+	else if((bio_data_dir(bio) != WRITE)){
 		bio_endio(io->base_bio);
 		return DM_MAPIO_SUBMITTED;	
 	}
+*/
 
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))

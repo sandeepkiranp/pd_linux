@@ -97,8 +97,8 @@
 #define malloc(x) kmalloc(x, GFP_KERNEL)
 #define free(x) kfree(x)
 
-// Default order is 4.
-#define DEFAULT_ORDER 4
+// Default order is 16.
+#define DEFAULT_ORDER  16 
 
 // Minimum order is necessarily 3.  We set the maximum
 // order arbitrarily.  You may change the maximum order.
