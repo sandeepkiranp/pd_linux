@@ -87,6 +87,7 @@ struct crypt_config {
         struct percpu_counter n_allocated_pages;
 
         struct workqueue_struct *io_queue;
+        struct workqueue_struct *map_queue;
         struct workqueue_struct *crypt_queue;
 
         spinlock_t write_thread_lock;

@@ -225,6 +225,11 @@ void addto_freelist(unsigned sector)
 	while(temp != NULL) {
 		if(sector < temp->sector)
 			break;
+		if(sector == temp->sector) {
+			printk("sector %d already exists in freelist, total elements in freelist %d\n", sector, total_freelist);
+			kfree(node);
+			return;
+		}
 		prev = temp;
 		temp = temp->next;
 	}
@@ -232,7 +237,7 @@ void addto_freelist(unsigned sector)
 	prev->next = node;
 unlock:
 	total_freelist++;
-	printk("addto_freelist, total elements in freelist %d\n", total_freelist);
+	printk("addto_freelist, added %d, total elements in freelist %d\n", sector, total_freelist);
 	//UNLOCK
 	return;
 }
@@ -258,6 +263,8 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
         struct freelist *prev = head_freelist;
         unsigned current_sector_count = 0;
         int i = 0;
+
+	printk("getfrom_freelist, requested %d sectors from total of %d\n", sector_count, total_freelist);
 
 	if (c_y == NULL) { //there's only one node
 		if (sector_count != 1)
@@ -308,6 +315,7 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
 			                else {
                        	 			prev_c_x->next = c_y;
 				        }
+					total_freelist -= sector_count;
                                         return 0;
                                 }
                         }
@@ -349,6 +357,7 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
 	//UNLOCK
 	if(current_sector_count != sector_count) {
 		//on failure, restore any sectors added to results
+		printk("getfrom_freelist Found only %d free sectors out of required %d sectors. Restoring back\n", current_sector_count, sector_count);
 		int i = 0, j = 0;
 		while(results[i].start) {
 			for(j = results[i].start; j < results[i].start + results[i].len; j++)
@@ -357,8 +366,10 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
 		}
 		return -1;
 	}
-	else
+	else {
+		total_freelist -= sector_count;
 		return 0;
+	}
 }
 
 /*
@@ -2120,7 +2131,7 @@ static void crypt_endio(struct bio *clone)
                                 offset += cc->on_disk_tag_size;
                         }
 
-                        print_bio("Inside crypt_endio, hidden data before decryption", bio);
+                        //print_bio("Inside crypt_endio, hidden data before decryption", bio);
 
                         //print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
                         //print_bio("Inside crypt_endio", io->base_bio);
@@ -2185,6 +2196,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		io->freelist = kmalloc(bio_sectors(io->base_bio) * sizeof(io->freelist), GFP_KERNEL);
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
 			io->freelist[i] = kmalloc(num_sectors * sizeof(struct freelist_results), GFP_KERNEL);
+			for (j = 0; j < num_sectors; j++)
+				io->freelist[i][j].start = io->freelist[i][j].len = 0;
 		}
 
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
@@ -2192,8 +2205,9 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 				if(getfrom_freelist(num_sectors, io->freelist[i])) {
-					printk("Unable to find %d public sectors for hidden write\n", num_sectors);
-					//TODO: set io->error
+					printk("Unable to find %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
+					crypt_dec_pending(io);
+					io->error = BLK_STS_IOERR;	
 					return 1;
 				}
 			}
@@ -2203,8 +2217,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 			}
 			//TODO: club adjacent sectors to increase performance
-
-			while(j < num_sectors && io->freelist[i][j].start) {
+			printk("Iterating through freelist results [%d][%d] start %d, len %d\n", i, j, io->freelist[i][j].start, io->freelist[i][j].len);
+			while(j < num_sectors && io->freelist[i][j].len) {
 				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
 				printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
        		         	bio = crypt_alloc_buffer(io, assigned, tag_idx);
@@ -2288,11 +2302,11 @@ static void kcryptd_io_rdwr_map(struct work_struct *work)
 
         unsigned sector = io->base_bio->bi_iter.bi_sector;
         if (!io->freelist)
-            continue;
+            return;
         for(i = 0; i < bio_sectors(io->base_bio); i++) {
             //map_insert(sector, io->freelist[i]);
         }
-        return 0;
+        return;
 
 }
 
@@ -2640,7 +2654,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
                 io->flags |= PD_HIDDEN_OPERATION;
 
-		print_bio("write_convert after randombytes and magic", clone);
+		//print_bio("write_convert after randombytes and magic", clone);
 	}
 	else if (!(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                 printk("PD initiating READ during PUBLIC WRITE\n");
@@ -2699,7 +2713,6 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		printk("PD initiating READ during WRITE\n");
 		io->flags &= ~PD_HIDDEN_OPERATION;
 		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
-
 
 		kcryptd_queue_read(io);
 		crypt_dec_pending(io);
@@ -2859,17 +2872,18 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		unsigned sector = io->write_bio->bi_iter.bi_sector;
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
-		print_bio("kcryptd_crypt_read_convert, after decrypting hidden data", io->ctx.bio_out);
+		//print_bio("kcryptd_crypt_read_convert, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
-			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
 				printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV\n");
 				//refresh the randomness	
 		                get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
 			}
 			else {
-				printk("No hidden data present (magic %02hhx), generating random IV\n", buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG]);
+				printk("No hidden data present (magic %02hhx), generating random IV\n", 
+						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN + RANDOM_BYTES_PER_TAG]);
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
 				addto_freelist(sector);
@@ -2940,7 +2954,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->on_disk_tag_size;
 		//printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
-	    print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
+	    //print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
 
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
@@ -4296,18 +4310,18 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	else
 		io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
-/*
+
 	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
+		/*
 	        INIT_WORK(&io->work, kcryptd_io_rdwr_map);
         	queue_work(cc->map_queue, &io->work);
 		return DM_MAPIO_SUBMITTED;
-
+		*/
 	}
 	else if((bio_data_dir(bio) != WRITE)){
 		bio_endio(io->base_bio);
 		return DM_MAPIO_SUBMITTED;	
 	}
-*/
 
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))
