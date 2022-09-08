@@ -94,6 +94,17 @@
 
 #include "dm-crypt.h"
 
+#define ZONE_SIZE 10240 //10KB
+#define IV_PER_NODE 8
+#define NODE_SIZE IV_PER_NODE * 16 //bytes
+#define IS_LEAF_OFFSET 92 //bits
+#define IS_LEAF_LEN 8 //bits
+#define NUM_KEYS_OFFSET IS_LEAF_OFFSET + 8 //bits
+#define NUM_KEYS_LEN 8 //bits
+#define BITS_PER_ZONE_NUM 14
+
+#define BITS_PER_SECTOR_NUM 32
+
 #define malloc(x) kmalloc(x, GFP_KERNEL)
 #define free(x) kfree(x)
 
@@ -189,6 +200,8 @@ node * queue = NULL;
  * next to their corresponding keys.
  */
 bool verbose_output = false;
+
+node *root = NULL;
 
 
 // FUNCTION PROTOTYPES.
@@ -1524,20 +1537,70 @@ node * destroy_tree(node * root) {
 	destroy_tree_nodes(root);
 	return NULL;
 }
-/*
-map_insert(unsigned sector, struct freelist_results *res)
-{
-	insert(root, );
 
-}
-
-map_ctr(crypt_config *cc)
+void map_ctr(struct crypt_config *cc)
 {
 //build the root
 	
 
 }
-*/
+void map_dtr(struct crypt_config *cc)
+{
+// destroy the in-memory B+ Tree
+
+}
+
+bool get_is_leaf(unsigned char *data)
+{
+        unsigned short n;
+        memcpy(&n, data + (IS_LEAF_OFFSET/8), sizeof(n));
+        return (((1 << IS_LEAF_LEN) - 1) & (n >> (3 - 1)));
+}
+
+bool get_num_keys(unsigned char *data)
+{
+        unsigned short n;
+        memcpy(&n, data + (NUM_KEYS_OFFSET/8), sizeof(n));
+        return (((1 << NUM_KEYS_LEN) - 1) & (n >> (3 - 1)));
+}
+
+void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *node)
+{
+        unsigned char node_data[NODE_SIZE];
+       	unsigned int n, i;
+	unsigned offset = 0;
+
+        crypt_inc_pending(io);
+        rdwr_sector_metadata(io, REQ_OP_READ, sector, node_data, NODE_SIZE);
+        crypt_dec_pending(io);
+        //initialize is_leaf
+        node->is_leaf = (bool)node_data[12];
+        //initialize num of keys
+        node->num_keys = (int)node_data[13];
+        //initialize keys
+        for (i = 0; i < node->num_keys; i+=2) {
+	        memcpy(&n, node_data + offset, sizeof(n));
+		node->keys[i] = (((1 << BITS_PER_ZONE_NUM) - 1) & (n >> (4 - 1)));
+		node->keys[i+1] = (((1 << BITS_PER_ZONE_NUM) - 1) & (n >> (18 - 1)));
+		offset += 16;
+        }
+	offset = 0;
+	for (i = 0; i < order-2; i+=2) {
+		node->pointers[i]   = (int)node_data[offset + 4];
+		node->pointers[i+1] = (int)node_data[offset + 8];
+		offset += 16;
+	}
+	node->pointers[i] = (int) node_data[offset + 2];
+	node->pointers[i+1] = (int) node_data[offset + 6];
+	node->parent = (int) node_data[offset + 10];
+
+}
+
+void initialize_disknode_from_node(struct dm_crypt_io *io)
+{
+
+}
+
 void initialize_root(struct dm_crypt_io *io)
 {
         unsigned char root_data[16 * 10] = {10};
@@ -1547,6 +1610,17 @@ void initialize_root(struct dm_crypt_io *io)
         rdwr_sector_metadata(io, REQ_OP_READ, 10, rd_root_data, 160);
 	crypt_dec_pending(io);
 	printk("initialize_root memcmp %d\n", memcmp(root_data, rd_root_data, 16 * 10));
+}
+
+void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results *res)
+{
+	if (root == NULL) {
+		initialize_root(io);
+
+	}
+
+	//insert(root, );
+
 }
 
 /*

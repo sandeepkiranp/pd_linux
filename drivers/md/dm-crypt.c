@@ -108,6 +108,7 @@ static void kcryptd_queue_crypt(struct dm_crypt_io *io);
 static struct scatterlist *crypt_get_sg_data(struct crypt_config *cc,
 					     struct scatterlist *sg);
 static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async);
+static void kcryptd_io_rdwr_map(struct work_struct *work);
 
 static bool crypt_integrity_aead(struct crypt_config *cc);
 
@@ -2035,11 +2036,11 @@ static void crypt_endio(struct bio *clone)
 		crypt_free_buffer_pages(cc, clone);
 		if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 			io_free_pages(io);
-			//bio_put(clone);
+			bio_put(clone);
 			//update the map
-                	//INIT_WORK(&io->work, kcryptd_io_rdwr_map);
-                	//queue_work(cc->map_queue, &io->work);
-			//return;
+                	INIT_WORK(&io->work, kcryptd_io_rdwr_map);
+                	queue_work(cc->map_queue, &io->work);
+			return;
 		}
 	}
 
@@ -2296,18 +2297,21 @@ static void kcryptd_io_rdwr_map(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
         int i, j;
+        unsigned sector = io->base_bio->bi_iter.bi_sector;
+
 	printk("Inside kcryptd_io_rdwr_map %p\n", work);
 
 	//initialize_root(io);
 
-        unsigned sector = io->base_bio->bi_iter.bi_sector;
         if (!io->freelist)
-            return;
+            goto ret;
         for(i = 0; i < bio_sectors(io->base_bio); i++) {
-            //map_insert(sector, io->freelist[i]);
+            //map_insert(io, sector, io->freelist[i]);
+	    sector++;
         }
+ret:
+	crypt_dec_pending(io);
         return;
-
 }
 
 static void kcryptd_io_read_work(struct work_struct *work)
@@ -4322,6 +4326,8 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 		bio_endio(io->base_bio);
 		return DM_MAPIO_SUBMITTED;	
 	}
+		bio_endio(io->base_bio);
+		return DM_MAPIO_SUBMITTED;	
 
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))
