@@ -161,6 +161,11 @@ struct crypt_config {
         u8 key[];
 };
 
+struct freelist_results {
+        unsigned start;
+        int len;
+};
+
 struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size, int integ_offset);
 void crypt_convert_init(struct crypt_config *cc,
                                struct convert_context *ctx,
@@ -176,4 +181,6 @@ void crypt_dec_pending(struct dm_crypt_io *io);
 
 int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int offset);
 
-void initialize_root(struct dm_crypt_io *io);
+int getfrom_freelist(int sector_count, struct freelist_results *results);
+
+void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results *res);

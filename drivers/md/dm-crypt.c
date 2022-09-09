@@ -243,11 +243,6 @@ unlock:
 	return;
 }
 
-struct freelist_results {
-	unsigned start;
-	int len;
-};
-
 int getfrom_freelist(int sector_count, struct freelist_results *results)
 {
 	if (!head_freelist)
@@ -2301,12 +2296,10 @@ static void kcryptd_io_rdwr_map(struct work_struct *work)
 
 	printk("Inside kcryptd_io_rdwr_map %p\n", work);
 
-	//initialize_root(io);
-
         if (!io->freelist)
             goto ret;
         for(i = 0; i < bio_sectors(io->base_bio); i++) {
-            //map_insert(io, sector, io->freelist[i]);
+            map_insert(io, sector, io->freelist[i]);
 	    sector++;
         }
 ret:
