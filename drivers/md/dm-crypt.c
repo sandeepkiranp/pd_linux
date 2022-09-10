@@ -4308,19 +4308,10 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 		io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
 
-	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		/*
-	        INIT_WORK(&io->work, kcryptd_io_rdwr_map);
-        	queue_work(cc->map_queue, &io->work);
-		return DM_MAPIO_SUBMITTED;
-		*/
-	}
-	else if((bio_data_dir(bio) != WRITE)){
+	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (bio_data_dir(bio) != WRITE)) {
 		bio_endio(io->base_bio);
 		return DM_MAPIO_SUBMITTED;	
 	}
-		bio_endio(io->base_bio);
-		return DM_MAPIO_SUBMITTED;	
 
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))

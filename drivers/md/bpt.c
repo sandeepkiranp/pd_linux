@@ -245,8 +245,8 @@ node * insert_into_node_after_splitting(node * root, node * parent,
 		int key, node * right);
 node * insert_into_parent(node * root, node * left, int key, node * right);
 node * insert_into_new_root(node * left, int key, node * right);
-node * start_new_tree(int key, record * pointer);
-node * insert(node * root, int key, int value);
+node * start_new_tree(struct dm_crypt_io *io, int key, record * pointer);
+node * insert(struct dm_crypt_io *io, node * root, int key, int value);
 
 // Deletion.
 
@@ -260,7 +260,7 @@ node * redistribute_nodes(node * root, node * n, node * neighbor,
 node * delete_entry(node * root, node * n, int key, void * pointer);
 node * delete(node * root, int key);
 
-
+void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root);
 // FUNCTION DEFINITIONS.
 
 // OUTPUT AND UTILITIES
@@ -1087,7 +1087,8 @@ node * start_new_tree(struct dm_crypt_io *io, int key, record * pointer) {
 	root->pointers[order - 1] = NULL;
 	root->parent = NULL;
 	root->num_keys++;
-	initialize_disknode_from_node(io, root);
+	printk("Starting a new tree with key %d", key);
+	initialize_disknode_from_node(io, root, true);
 	return root;
 }
 
@@ -1108,7 +1109,7 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 	 * duplicates.
 	 */
 
-	record_pointer = find(io, root, key, false, NULL);
+	record_pointer = find(root, key, false, NULL);
 	if (record_pointer != NULL) {
 
 		/* If the key already exists in this tree, update
@@ -1137,7 +1138,7 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 	 * (Rest of function body.)
 	 */
 
-	leaf = find_leaf(io, root, key, false);
+	leaf = find_leaf(root, key, false);
 
 	/* Case: leaf has room for key and record_pointer.
 	 */
@@ -1556,13 +1557,17 @@ void map_dtr(struct crypt_config *cc)
 
 void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *node, unsigned char *data)
 {
-        unsigned char node_data[NODE_SIZE];
+        unsigned char ldata[NODE_SIZE];
+	unsigned char *node_data;
        	unsigned int n, i;
 	unsigned offset = 0;
 
+	printk("Inside initialize_node_from_disknode");
+
 	if (!data) {
         	crypt_inc_pending(io);
-        	rdwr_sector_metadata(io, REQ_OP_READ, sector, node_data, NODE_SIZE);
+        	rdwr_sector_metadata(io, REQ_OP_READ, sector, ldata, NODE_SIZE);
+		node_data = ldata;
         	crypt_dec_pending(io);
 	}
 	else
@@ -1589,12 +1594,14 @@ void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *nod
 	node->parent = (int) node_data[offset + 10];
 }
 
-void initialize_disknode_from_node(struct dm_crypt_io *io, node *node)
+void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root)
 {
         unsigned char node_data[NODE_SIZE];
-        unsigned int n, i;
+        unsigned int i;
         unsigned offset = 0;
 	struct freelist_results results[IV_PER_NODE] = {0};
+
+	printk("Inside initialize_disknode_from_node %s", is_root ? "IS ROOT" : "");
 
 	memset(node_data, 0, NODE_SIZE);
         //set is_leaf
@@ -1603,8 +1610,8 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node)
         node_data[13] = node->num_keys;
         //initialize keys
         for (i = 0; i < node->num_keys; i+=2) {
-                memcpy(node_data + offset, node->keys[i], 2);
-                memcpy(node_data + offset + 2, node->keys[i+1], 2);
+                memcpy(node_data + offset, &node->keys[i], 2);
+                memcpy(node_data + offset + 2, &node->keys[i+1], 2);
                 offset += 16;
         }
         offset = 0;
@@ -1616,6 +1623,9 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node)
         node_data[offset + 2] = node->pointers[i];
         node_data[offset + 6] = node->pointers[i+1];
         node_data[offset + 10] = node->parent;
+
+	if (is_root)
+		node_data[ROOT_MAGIC_POSN - 1] = ROOT_INITIALIZED;
 
 	crypt_inc_pending(io);
 	// get required number of public writes for this hidden operation
@@ -1630,25 +1640,39 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node)
 struct node * initialize_root(struct dm_crypt_io *io)
 {
 	unsigned char root_data[NODE_SIZE];
+
+	printk("Inside initialize_root\n");
 	crypt_inc_pending(io);
         rdwr_sector_metadata(io, REQ_OP_READ, 0, root_data, NODE_SIZE);
 	crypt_dec_pending(io);
-	if (root_data[ROOT_MAGIC_POSN - 1] != ROOT_INITIALIZED)
+	if ((unsigned char)root_data[ROOT_MAGIC_POSN - 1] != ROOT_INITIALIZED) {
+		printk("Root node uninitialized");
 		return NULL;
+	}
 	else {
+		int i;
+		printk("Root node initialized");
 		node *node = make_leaf();
 		initialize_node_from_disknode(io, 0, node, root_data);
+		printk("root is_leaf %s, has %d keys", node->is_leaf ? "YES" : "NO", node->num_keys);
+	        for (i = 0; i < order; i+=2) {
+        	        printk("pointer sectors [%d] \n", node->pointers[i]);
+        	}
+        	printk("parent sector [%d] \n", node->parent);
+
 		return node;
 	}
 }
 
 void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results *res)
 {
+	printk("Inside map_insert logical sector %d, physical sector %d\n", sector, res[0].start);
 	if (root == NULL) {
 		root = initialize_root(io);
 	}
 
 	root = insert(io, root, sector, res[0].start);
+	initialize_root(io);
 }
 
 /*
