@@ -1084,11 +1084,11 @@ node * start_new_tree(struct dm_crypt_io *io, int key, record * pointer) {
 
 	node * root = make_leaf();
 	root->keys[0] = key;
-	root->pointers[0] = pointer;
+	root->pointers[0] = pointer->value;
 	root->pointers[order - 1] = NULL;
 	root->parent = NULL;
 	root->num_keys++;
-	printk("Starting a new tree with key %d", key);
+	printk("Starting a new tree with key %d, pointer %d", key, pointer->value);
 	initialize_disknode_from_node(io, root, true);
 	return root;
 }
@@ -1661,7 +1661,9 @@ struct node * initialize_root(struct dm_crypt_io *io)
 		node *node = make_leaf();
 		initialize_node_from_disknode(io, START_OF_ROOT_NODE, node, root_data);
 		printk("root is_leaf %s, has %d keys", node->is_leaf ? "YES" : "NO", node->num_keys);
-	        for (i = 0; i < order; i++) {
+		for (i=0; i < node->num_keys; i++)
+			printk("Key at index [%d] is %d", node->keys[i]);
+	        for (i = 0; i < node->num_keys + 1; i++) {
         	        printk("pointer sectors [%d] \n", node->pointers[i]);
         	}
         	printk("parent sector [%d] \n", node->parent);
