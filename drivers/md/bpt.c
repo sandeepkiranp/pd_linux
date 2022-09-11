@@ -222,12 +222,12 @@ int height(node * const root);
 int path_to_root(node * const root, node * child);
 void print_leaves(node * const root);
 void print_tree(node * const root);
-void find_and_print(node * const root, int key, bool verbose); 
-void find_and_print_range(node * const root, int range1, int range2, bool verbose); 
-int find_range(node * const root, int key_start, int key_end, bool verbose,
+void find_and_print(struct dm_crypt_io *io, node * const root, int key, bool verbose); 
+void find_and_print_range(struct dm_crypt_io *io, node * const root, int range1, int range2, bool verbose); 
+int find_range(struct dm_crypt_io *io,node * const root, int key_start, int key_end, bool verbose,
 		int returned_keys[], void * returned_pointers[]); 
-node * find_leaf(node * const root, int key, bool verbose);
-record * find(node * root, int key, bool verbose, node ** leaf_out);
+node * find_leaf(struct dm_crypt_io *io, node * const root, int key, bool verbose);
+record * find(struct dm_crypt_io *io, node * root, int key, bool verbose, node ** leaf_out);
 int cut(int length);
 
 // Insertion.
@@ -253,13 +253,13 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value);
 
 int get_neighbor_index(node * n);
 node * adjust_root(node * root);
-node * coalesce_nodes(node * root, node * n, node * neighbor,
+node * coalesce_nodes(struct dm_crypt_io *io, node * root, node * n, node * neighbor,
 					  int neighbor_index, int k_prime);
 node * redistribute_nodes(node * root, node * n, node * neighbor,
 						  int neighbor_index,
 		int k_prime_index, int k_prime);
-node * delete_entry(node * root, node * n, int key, void * pointer);
-node * delete(node * root, int key);
+node * delete_entry(struct dm_crypt_io *io, node * root, node * n, int key, void * pointer);
+node * delete(struct dm_crypt_io *io, node * root, int key);
 
 void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root);
 // FUNCTION DEFINITIONS.
@@ -632,9 +632,9 @@ void print_tree(node * const root) {
 /* Finds the record under a given key and prints an
  * appropriate message to stdout.
  */
-void find_and_print(node * const root, int key, bool verbose) {
+void find_and_print(struct dm_crypt_io *io, node * const root, int key, bool verbose) {
 	node * leaf = NULL;
-	record * r = find(root, key, verbose, NULL);
+	record * r = find(io, root, key, verbose, NULL);
 	if (r == NULL)
 		printk("Record not found under key %d.\n", key);
 	else 
@@ -646,13 +646,13 @@ void find_and_print(node * const root, int key, bool verbose) {
 /* Finds and prints the keys, pointers, and values within a range
  * of keys between key_start and key_end, including both bounds.
  */
-void find_and_print_range(node * const root, int key_start, int key_end,
+void find_and_print_range(struct dm_crypt_io *io, node * const root, int key_start, int key_end,
 		bool verbose) {
 	int i;
 	int array_size = key_end - key_start + 1;
 	int returned_keys[array_size];
 	void * returned_pointers[array_size];
-	int num_found = find_range(root, key_start, key_end, verbose,
+	int num_found = find_range(io, root, key_start, key_end, verbose,
 			returned_keys, returned_pointers);
 	if (!num_found)
 		printk("None found.\n");
@@ -672,11 +672,11 @@ void find_and_print_range(node * const root, int key_start, int key_end,
  * returned_keys and returned_pointers, and returns the number of
  * entries found.
  */
-int find_range(node * const root, int key_start, int key_end, bool verbose,
+int find_range(struct dm_crypt_io *io, node * const root, int key_start, int key_end, bool verbose,
 		int returned_keys[], void * returned_pointers[]) {
 	int i, num_found;
 	num_found = 0;
-	node * n = find_leaf(root, key_start, verbose);
+	node * n = find_leaf(io, root, key_start, verbose);
 	if (n == NULL) return 0;
 	for (i = 0; i < n->num_keys && n->keys[i] < key_start; i++) ;
 	if (i == n->num_keys) return 0;
@@ -698,7 +698,7 @@ int find_range(node * const root, int key_start, int key_end, bool verbose,
  * if the verbose flag is set.
  * Returns the leaf containing the given key.
  */
-node * find_leaf(node * const root, int key, bool verbose) {
+node * find_leaf(struct dm_crypt_io *io, node * const root, int key, bool verbose) {
 	if (root == NULL) {
 		return root;
 	}
@@ -719,7 +719,7 @@ node * find_leaf(node * const root, int key, bool verbose) {
 /* Finds and returns the record to which
  * a key refers.
  */
-record * find(node * root, int key, bool verbose, node ** leaf_out) {
+record * find(struct dm_crypt_io *io, node * root, int key, bool verbose, node ** leaf_out) {
 	if (root == NULL) {
 		if (leaf_out != NULL) {
 			*leaf_out = NULL;
@@ -730,7 +730,7 @@ record * find(node * root, int key, bool verbose, node ** leaf_out) {
 	int i = 0;
 	node * leaf = NULL;
 
-	leaf = find_leaf(root, key, verbose);
+	leaf = find_leaf(io, root, key, verbose);
 
 	/* If root != NULL, leaf must have a value, even
 	 * if it does not contain the desired key.
@@ -1105,19 +1105,22 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 
 	record * record_pointer = NULL;
 	node * leaf = NULL;
+	node * key_leaf = NULL;
 
 	/* The current implementation ignores
 	 * duplicates.
 	 */
+	printk("Inside insert, root %p, key %d, value %d", root, key, value);
 
-	record_pointer = find(root, key, false, NULL);
+	record_pointer = find(io, root, key, false, &key_leaf);
 	if (record_pointer != NULL) {
 
 		/* If the key already exists in this tree, update
 		 * the value and return the tree.
 		 */
-
+		printk("Key %d already in map. Refreshing it", key);
 		record_pointer->value = value;
+		initialize_disknode_from_node(io, key_leaf, key_leaf == root);
 		return root;
 	}
 
@@ -1139,7 +1142,7 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 	 * (Rest of function body.)
 	 */
 
-	leaf = find_leaf(root, key, false);
+	leaf = find_leaf(io, root, key, false);
 
 	/* Case: leaf has room for key and record_pointer.
 	 */
@@ -1270,7 +1273,7 @@ node * adjust_root(node * root) {
  * can accept the additional entries
  * without exceeding the maximum.
  */
-node * coalesce_nodes(node * root, node * n, node * neighbor, int neighbor_index, int k_prime) {
+node * coalesce_nodes(struct dm_crypt_io *io, node * root, node * n, node * neighbor, int neighbor_index, int k_prime) {
 
 	int i, j, neighbor_insertion_index, n_end;
 	node * tmp;
@@ -1346,7 +1349,7 @@ node * coalesce_nodes(node * root, node * n, node * neighbor, int neighbor_index
 		neighbor->pointers[order - 1] = n->pointers[order - 1];
 	}
 
-	root = delete_entry(root, n->parent, k_prime, n);
+	root = delete_entry(io, root, n->parent, k_prime, n);
 	free(n->keys);
 	free(n->pointers);
 	free(n); 
@@ -1437,7 +1440,7 @@ node * redistribute_nodes(node * root, node * n, node * neighbor, int neighbor_i
  * from the leaf, and then makes all appropriate
  * changes to preserve the B+ tree properties.
  */
-node * delete_entry(node * root, node * n, int key, void * pointer) {
+node * delete_entry(struct dm_crypt_io *io, node * root, node * n, int key, void * pointer) {
 
 	int min_keys;
 	node * neighbor;
@@ -1496,7 +1499,7 @@ node * delete_entry(node * root, node * n, int key, void * pointer) {
 	/* Coalescence. */
 
 	if (neighbor->num_keys + n->num_keys < capacity)
-		return coalesce_nodes(root, n, neighbor, neighbor_index, k_prime);
+		return coalesce_nodes(io, root, n, neighbor, neighbor_index, k_prime);
 
 	/* Redistribution. */
 
@@ -1508,39 +1511,39 @@ node * delete_entry(node * root, node * n, int key, void * pointer) {
 
 /* Master deletion function.
  */
-node * delete(node * root, int key) {
+node * delete(struct dm_crypt_io *io, node * root, int key) {
 
 	node * key_leaf = NULL;
 	record * key_record = NULL;
 
-	key_record = find(root, key, false, &key_leaf);
+	key_record = find(io, root, key, false, &key_leaf);
 
 	/* CHANGE */
 
 	if (key_record != NULL && key_leaf != NULL) {
-		root = delete_entry(root, key_leaf, key, key_record);
+		root = delete_entry(io, root, key_leaf, key, key_record);
 		free(key_record);
 	}
 	return root;
 }
 
 
-void destroy_tree_nodes(node * root) {
+void destroy_tree_nodes(struct dm_crypt_io *io, node * root) {
 	int i;
 	if (root->is_leaf)
 		for (i = 0; i < root->num_keys; i++)
 			free(root->pointers[i]);
 	else
 		for (i = 0; i < root->num_keys + 1; i++)
-			destroy_tree_nodes(root->pointers[i]);
+			destroy_tree_nodes(io, root->pointers[i]);
 	free(root->pointers);
 	free(root->keys);
 	free(root);
 }
 
 
-node * destroy_tree(node * root) {
-	destroy_tree_nodes(root);
+node * destroy_tree(struct dm_crypt_io *io, node * root) {
+	destroy_tree_nodes(io, root);
 	return NULL;
 }
 
@@ -1616,6 +1619,7 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_r
                 memcpy(node_data + offset + 2, &node->keys[i+1], 2);
                 offset += 16;
         }
+	//initialize pointers
         offset = 0;
         for (i = 0; i < order-2; i+=2) {
                 memcpy(node_data + offset + 4, &node->pointers[i], 4);
@@ -1625,6 +1629,12 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_r
         memcpy(node_data + offset + 2, &node->pointers[i], 4);
         memcpy(node_data + offset + 6, &node->pointers[i+1], 4);
         memcpy(node_data + offset + 10, &node->parent, 4);
+
+	offset = 0;
+	for (i = 0; i < IV_PER_NODE; i++) {
+		node_data[offset + 15] = PD_MAP_MAGIC_DATA;
+		offset  += 16;
+	}
 
 	crypt_inc_pending(io);
 	if (is_root) {
@@ -1680,7 +1690,7 @@ void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results
 	}
 
 	root = insert(io, root, sector, res[0].start);
-	initialize_root(io);
+	//initialize_root(io);
 }
 
 /*
