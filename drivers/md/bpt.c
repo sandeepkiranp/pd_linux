@@ -107,6 +107,7 @@
 
 #define ROOT_MAGIC_POSN 28
 #define ROOT_INITIALIZED 0xAA
+#define START_OF_ROOT_NODE 0
 
 #define malloc(x) kmalloc(x, GFP_KERNEL)
 #define free(x) kfree(x)
@@ -1572,11 +1573,12 @@ void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *nod
 	}
 	else
 		node_data = data;
-	memset(node, 0, sizeof(node));
         //initialize is_leaf
         node->is_leaf = (bool)node_data[12];
         //initialize num of keys
         node->num_keys = (int)node_data[13];
+
+	printk("initialize_node_from_disknode is_leaf %s, num_keys %d", node->is_leaf ? "YES" : "NO", node->num_keys);
         //initialize keys
         for (i = 0; i < node->num_keys; i+=2) {
 		memcpy(&node->keys[i], node_data + offset, 2);
@@ -1585,13 +1587,13 @@ void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *nod
         }
 	offset = 0;
 	for (i = 0; i < order-2; i+=2) {
-		node->pointers[i]   = (int)node_data[offset + 4];
-		node->pointers[i+1] = (int)node_data[offset + 8];
+		memcpy(&node->pointers[i], node_data + offset + 4, 4);
+		memcpy(&node->pointers[i+1], node_data + offset + 8, 4);
 		offset += 16;
 	}
-	node->pointers[i] = (int) node_data[offset + 2];
-	node->pointers[i+1] = (int) node_data[offset + 6];
-	node->parent = (int) node_data[offset + 10];
+	memcpy(&node->pointers[i], node_data + offset + 2, 4);
+	memcpy(&node->pointers[i+1], node_data + offset + 6, 4);
+	memcpy(&node->parent, node_data + offset + 10, 4);
 }
 
 void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root)
@@ -1616,22 +1618,26 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_r
         }
         offset = 0;
         for (i = 0; i < order-2; i+=2) {
-                node_data[offset + 4] = node->pointers[i];
-                node_data[offset + 8] = node->pointers[i+1];
+                memcpy(node_data + offset + 4, &node->pointers[i], 4);
+                memcpy(node_data + offset + 8, &node->pointers[i+1], 4);
                 offset += 16;
         }
-        node_data[offset + 2] = node->pointers[i];
-        node_data[offset + 6] = node->pointers[i+1];
-        node_data[offset + 10] = node->parent;
-
-	if (is_root)
-		node_data[ROOT_MAGIC_POSN - 1] = ROOT_INITIALIZED;
+        memcpy(node_data + offset + 2, &node->pointers[i], 4);
+        memcpy(node_data + offset + 6, &node->pointers[i+1], 4);
+        memcpy(node_data + offset + 10, &node->parent, 4);
 
 	crypt_inc_pending(io);
-	// get required number of public writes for this hidden operation
-	if(getfrom_freelist(IV_PER_NODE, results)) {
-		printk("Unable to find %d public sectors for hidden write", IV_PER_NODE);
-		return;
+	if (is_root) {
+		node_data[ROOT_MAGIC_POSN - 1] = ROOT_INITIALIZED;
+		results[0].start = START_OF_ROOT_NODE;
+	}
+	else {
+		// get required number of public writes for this hidden operation
+		if(getfrom_freelist(IV_PER_NODE, results)) {
+			printk("Unable to find %d public sectors for hidden write", IV_PER_NODE);
+        		crypt_dec_pending(io);
+			return;
+		}
 	}
         rdwr_sector_metadata(io, REQ_OP_WRITE, results[0].start, node_data, NODE_SIZE);
         crypt_dec_pending(io);
@@ -1643,19 +1649,19 @@ struct node * initialize_root(struct dm_crypt_io *io)
 
 	printk("Inside initialize_root\n");
 	crypt_inc_pending(io);
-        rdwr_sector_metadata(io, REQ_OP_READ, 0, root_data, NODE_SIZE);
+        rdwr_sector_metadata(io, REQ_OP_READ, START_OF_ROOT_NODE, root_data, NODE_SIZE);
 	crypt_dec_pending(io);
 	if ((unsigned char)root_data[ROOT_MAGIC_POSN - 1] != ROOT_INITIALIZED) {
-		printk("Root node uninitialized");
+		printk("Root node UNinitialized actual %02hhx expected %02hhx", root_data[ROOT_MAGIC_POSN - 1], ROOT_INITIALIZED);
 		return NULL;
 	}
 	else {
 		int i;
-		printk("Root node initialized");
+		printk("Root node INitialized");
 		node *node = make_leaf();
-		initialize_node_from_disknode(io, 0, node, root_data);
+		initialize_node_from_disknode(io, START_OF_ROOT_NODE, node, root_data);
 		printk("root is_leaf %s, has %d keys", node->is_leaf ? "YES" : "NO", node->num_keys);
-	        for (i = 0; i < order; i+=2) {
+	        for (i = 0; i < order; i++) {
         	        printk("pointer sectors [%d] \n", node->pointers[i]);
         	}
         	printk("parent sector [%d] \n", node->parent);
