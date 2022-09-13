@@ -1862,7 +1862,7 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	dio->bi_status = 0;
 	dio->op = bio_op(bio);
 
-	printk("Inside dm_integrity_map incoming bio sector %d, size %d\n", bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+	//printk("Inside dm_integrity_map incoming bio sector %d, size %d\n", bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
 
 	if (unlikely(dio->op == REQ_OP_DISCARD)) {
 		if (ti->max_io_len) {

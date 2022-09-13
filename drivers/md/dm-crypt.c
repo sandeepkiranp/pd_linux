@@ -114,6 +114,8 @@ static bool crypt_integrity_aead(struct crypt_config *cc);
 
 struct file *bio_file = NULL;
 
+#define printk(f_, ...) 
+
 void print_integrity_metadata(char *msg, char *data)
 {
 	char str[200] = {0};

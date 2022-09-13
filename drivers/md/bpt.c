@@ -169,6 +169,7 @@ typedef struct record {
  */
 typedef struct node {
 	void ** pointers;
+	bool *pointers_expanded;
 	int * keys;
 	struct node * parent;
 	bool is_leaf;
@@ -262,6 +263,7 @@ node * delete_entry(struct dm_crypt_io *io, node * root, node * n, int key, void
 node * delete(struct dm_crypt_io *io, node * root, int key);
 
 void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root);
+void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *node, unsigned char *data);
 // FUNCTION DEFINITIONS.
 
 // OUTPUT AND UTILITIES
@@ -292,17 +294,13 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
                 bio->bi_opf = REQ_OP_READ | REQ_INTEGRITY;
                 bio->bi_iter.bi_sector = sector;
                 crypt_inc_pending(io);
-                printk("rdrw_sector before submit_bio_remap\n");
                 dm_submit_bio_remap(io->base_bio, bio);
-                printk("rdrw_sector after submit_bio_remap\n");
                 wait_for_completion(&io->map_complete);
                 reinit_completion(&io->map_complete);
-                printk("rdrw_sector after reinit_completionn");
 
 		// decrypt the data read
 		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx, false, true);
-                printk("rdrw_sector after public read");
 
 		// encrypt the hidden input data
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
@@ -323,7 +321,6 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		r = crypt_convert(cc, &io->ctx, false, true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
-                printk("rdrw_sector after hidden encryption");
 
 		// copy encrypted input data to integrity metadata
 		iter_out = hbio->bi_iter;
@@ -352,14 +349,11 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 
 		crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx, false, true);
-                printk("rdrw_sector after public encryption");
 		io->flags &= ~PD_READ_DURING_HIDDEN_WRITE;
                 bio->bi_opf = REQ_OP_WRITE | REQ_INTEGRITY;
                 dm_submit_bio_remap(io->base_bio, bio);
-                printk("rdrw_sector after submit_bio_remap\n");
                 wait_for_completion(&io->map_complete);
                 reinit_completion(&io->map_complete);
-                printk("rdrw_sector after reinit_completionn");
 
 		crypt_free_buffer_pages(cc, bio);
 		bio_put(bio);
@@ -377,12 +371,9 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		bio->bi_opf = REQ_OP_READ | REQ_INTEGRITY;
 		bio->bi_iter.bi_sector = sector;
 		crypt_inc_pending(io);
-		printk("rdrw_sector before submit_bio_remap\n");
 		dm_submit_bio_remap(io->base_bio, bio);
-		printk("rdrw_sector after submit_bio_remap\n");
 		wait_for_completion(&io->map_complete);
 		reinit_completion(&io->map_complete);
-		printk("rdrw_sector after reinit_completionn");
 
 		//decrypt the integrity metadata
 		struct bio *hbio = crypt_alloc_buffer(io, size, 0);
@@ -398,12 +389,10 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 		}
 		hbio->bi_opf = REQ_OP_READ;
 		io->flags |= PD_HIDDEN_OPERATION;
-		printk("rdrw_sector before crypt_convert");
 		crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx, false, true);
 
 		io->flags &= ~PD_HIDDEN_OPERATION;
-		printk("rdrw_sector after crypt_convert");
 		// copy decrypted data to output
 		iter_out = hbio->bi_iter;
 		offset = 0;
@@ -415,7 +404,6 @@ static int rdwr_sector_metadata(struct dm_crypt_io *io, int op, sector_t sector,
 			bio_advance_iter(hbio, &iter_out, size);
 			offset += size;
 		}
-		printk("rdrw_sector node data present in output");
                 crypt_free_buffer_pages(cc, bio);
                 bio_put(bio);
                 crypt_free_buffer_pages(cc, hbio);
@@ -699,10 +687,10 @@ int find_range(struct dm_crypt_io *io, node * const root, int key_start, int key
  * Returns the leaf containing the given key.
  */
 node * find_leaf(struct dm_crypt_io *io, node * const root, int key, bool verbose) {
+	int i = 0;
 	if (root == NULL) {
 		return root;
 	}
-	int i = 0;
 	node * c = root;
 	while (!c->is_leaf) {
 		i = 0;
@@ -710,7 +698,15 @@ node * find_leaf(struct dm_crypt_io *io, node * const root, int key, bool verbos
 			if (key >= c->keys[i]) i++;
 			else break;
 		}
-		c = (node *)c->pointers[i];
+		if (c->pointers_expanded[i])
+			c = (node *)c->pointers[i];
+		else {
+			node *n = make_node();
+			initialize_node_from_disknode(io, c->pointers[i], n, NULL);
+			c->pointers[i] = n;
+			c->pointers_expanded[i] = true;
+			c = n;
+		}
 	}
 	return c;
 }
@@ -749,6 +745,39 @@ record * find(struct dm_crypt_io *io, node * root, int key, bool verbose, node *
 		return (record *)leaf->pointers[i];
 }
 
+record * find_update(struct dm_crypt_io *io, node * root, int key, bool verbose, node ** leaf_out, int value) {
+        if (root == NULL) {
+                if (leaf_out != NULL) {
+                        *leaf_out = NULL;
+                }
+                return NULL;
+        }
+
+        int i = 0;
+        node * leaf = NULL;
+
+        leaf = find_leaf(io, root, key, verbose);
+
+        /* If root != NULL, leaf must have a value, even
+         * if it does not contain the desired key.
+         * (The leaf holds the range of keys that would
+         * include the desired key.)
+         */
+
+        for (i = 0; i < leaf->num_keys; i++)
+                if (leaf->keys[i] == key) break;
+        if (leaf_out != NULL) {
+                *leaf_out = leaf;
+        }
+        if (i == leaf->num_keys)
+                return NULL;
+        else {
+		leaf->pointers[i] = value;
+                return (record *)leaf->pointers[i];
+	}
+}
+
+
 /* Finds the appropriate place to
  * split a node that is too big into two.
  */
@@ -782,6 +811,7 @@ record * make_record(int value) {
  */
 node * make_node(void) {
 	node * new_node;
+	int i;
 	new_node = malloc(sizeof(node));
 	if (new_node == NULL) {
 		printk("Node creation.");
@@ -794,6 +824,12 @@ node * make_node(void) {
 	if (new_node->pointers == NULL) {
 		printk("New node pointers array.");
 	}
+        new_node->pointers_expanded = malloc(order * sizeof(bool));
+        if (new_node->pointers_expanded == NULL) {
+                printk("New node pointers_expanded array.");
+        }
+	for(i = 0; i < order; i++)
+		new_node->pointers_expanded[i] = false;
 	new_node->is_leaf = false;
 	new_node->num_keys = 0;
 	new_node->parent = NULL;
@@ -841,7 +877,7 @@ node * insert_into_leaf(struct dm_crypt_io *io, node * leaf, int key, record * p
 		leaf->pointers[i] = leaf->pointers[i - 1];
 	}
 	leaf->keys[insertion_point] = key;
-	leaf->pointers[insertion_point] = pointer;
+	leaf->pointers[insertion_point] = pointer->value;
 	leaf->num_keys++;
 	return leaf;
 }
@@ -1067,7 +1103,9 @@ node * insert_into_new_root(node * left, int key, node * right) {
 	node * root = make_node();
 	root->keys[0] = key;
 	root->pointers[0] = left;
+	root->pointers_expanded[0] = true;
 	root->pointers[1] = right;
+	root->pointers_expanded[1] = true;
 	root->num_keys++;
 	root->parent = NULL;
 	left->parent = root;
@@ -1112,14 +1150,14 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 	 */
 	printk("Inside insert, root %p, key %d, value %d", root, key, value);
 
-	record_pointer = find(io, root, key, false, &key_leaf);
+	record_pointer = find_update(io, root, key, false, &key_leaf, value);
 	if (record_pointer != NULL) {
 
 		/* If the key already exists in this tree, update
 		 * the value and return the tree.
 		 */
 		printk("Key %d already in map. Refreshing it", key);
-		record_pointer->value = value;
+		//record_pointer->value = value;
 		initialize_disknode_from_node(io, key_leaf, key_leaf == root);
 		return root;
 	}
@@ -1149,6 +1187,7 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 
 	if (leaf->num_keys < order - 1) {
 		leaf = insert_into_leaf(io, leaf, key, record_pointer);
+		initialize_disknode_from_node(io, leaf, leaf == root);
 		return root;
 	}
 
