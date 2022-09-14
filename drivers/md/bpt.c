@@ -170,8 +170,10 @@ typedef struct record {
 typedef struct node {
 	void ** pointers;
 	bool *pointers_expanded;
+	unsigned *pointers_disk;
 	int * keys;
 	struct node * parent;
+	struct node * parent_disk;
 	bool is_leaf;
 	int num_keys;
 	struct node * next; // Used for queue.
@@ -240,12 +242,11 @@ int get_left_index(node * parent, node * left);
 node * insert_into_leaf(struct dm_crypt_io *io, node * leaf, int key, record * pointer);
 node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, node * leaf, int key,
 										record * pointer);
-node * insert_into_node(node * root, node * parent, 
-		int left_index, int key, node * right);
-node * insert_into_node_after_splitting(node * root, node * parent,
-										int left_index,
-		int key, node * right);
-node * insert_into_parent(node * root, node * left, int key, node * right);
+node * insert_into_node(struct dm_crypt_io *io, node * root, node * parent, 
+		int left_index, int key, node * right, unsigned left_disk, unsigned right_disk);
+node * insert_into_node_after_splitting(node * root, node * parent, int left_index,
+		int key, node * right, unsigned right_disk);
+node * insert_into_parent(struct dm_crypt_io *io,node * root, node * left, int key, node * right, unsigned left_disk, unsigned right_disk);
 node * insert_into_new_root(node * left, int key, node * right);
 node * start_new_tree(struct dm_crypt_io *io, int key, record * pointer);
 node * insert(struct dm_crypt_io *io, node * root, int key, int value);
@@ -262,7 +263,7 @@ node * redistribute_nodes(node * root, node * n, node * neighbor,
 node * delete_entry(struct dm_crypt_io *io, node * root, node * n, int key, void * pointer);
 node * delete(struct dm_crypt_io *io, node * root, int key);
 
-void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root);
+unsigned initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root);
 void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *node, unsigned char *data);
 // FUNCTION DEFINITIONS.
 
@@ -702,7 +703,7 @@ node * find_leaf(struct dm_crypt_io *io, node * const root, int key, bool verbos
 			c = (node *)c->pointers[i];
 		else {
 			node *n = make_node();
-			initialize_node_from_disknode(io, c->pointers[i], n, NULL);
+			initialize_node_from_disknode(io, c->pointers_disk[i], n, NULL);
 			c->pointers[i] = n;
 			c->pointers_expanded[i] = true;
 			c = n;
@@ -772,7 +773,7 @@ record * find_update(struct dm_crypt_io *io, node * root, int key, bool verbose,
         if (i == leaf->num_keys)
                 return NULL;
         else {
-		leaf->pointers[i] = value;
+		leaf->pointers_disk[i] = value;
                 return (record *)leaf->pointers[i];
 	}
 }
@@ -828,6 +829,10 @@ node * make_node(void) {
         if (new_node->pointers_expanded == NULL) {
                 printk("New node pointers_expanded array.");
         }
+        new_node->pointers_disk = malloc(order * sizeof(unsigned));
+        if (new_node->pointers_expanded == NULL) {
+                printk("New node pointers_disk array.");
+        }
 	for(i = 0; i < order; i++)
 		new_node->pointers_expanded[i] = false;
 	new_node->is_leaf = false;
@@ -875,9 +880,11 @@ node * insert_into_leaf(struct dm_crypt_io *io, node * leaf, int key, record * p
 	for (i = leaf->num_keys; i > insertion_point; i--) {
 		leaf->keys[i] = leaf->keys[i - 1];
 		leaf->pointers[i] = leaf->pointers[i - 1];
+		leaf->pointers_disk[i] = leaf->pointers_disk[i - 1];
 	}
 	leaf->keys[insertion_point] = key;
 	leaf->pointers[insertion_point] = pointer->value;
+	leaf->pointers_disk[insertion_point] = pointer->value;
 	leaf->num_keys++;
 	return leaf;
 }
@@ -892,8 +899,12 @@ node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, nod
 
 	node * new_leaf;
 	int * temp_keys;
-	void ** temp_pointers;
+	void ** temp_pointers
+	unsigned * temp_pointers_disk;
 	int insertion_index, split, new_key, i, j;
+	unsigned new_leaf_disk, leaf_disk;
+
+	printk("Inside insert_into_leaf_after_splitting key %d, value %d", key, pointer->value);
 
 	new_leaf = make_leaf();
 
@@ -907,6 +918,11 @@ node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, nod
 		printk("Temporary pointers array.");
 	}
 
+	temp_pointers_disk = malloc(order * sizeof(unsigned));
+	if (temp_pointers == NULL) {
+		printk("Temporary pointers_disk array.");
+	}
+
 	insertion_index = 0;
 	while (insertion_index < order - 1 && leaf->keys[insertion_index] < key)
 		insertion_index++;
@@ -915,10 +931,12 @@ node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, nod
 		if (j == insertion_index) j++;
 		temp_keys[j] = leaf->keys[i];
 		temp_pointers[j] = leaf->pointers[i];
+		temp_pointers_disk[j] = leaf->pointers_disk[i];
 	}
 
 	temp_keys[insertion_index] = key;
 	temp_pointers[insertion_index] = pointer;
+	temp_pointers_disk[insertion_index] = pointer->value;
 
 	leaf->num_keys = 0;
 
@@ -926,20 +944,24 @@ node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, nod
 
 	for (i = 0; i < split; i++) {
 		leaf->pointers[i] = temp_pointers[i];
+		leaf->pointers_disk[i] = temp_pointers_disk[i];
 		leaf->keys[i] = temp_keys[i];
 		leaf->num_keys++;
 	}
 
 	for (i = split, j = 0; i < order; i++, j++) {
 		new_leaf->pointers[j] = temp_pointers[i];
+		new_leaf->pointers_disk[j] = temp_pointers_disk[i];
 		new_leaf->keys[j] = temp_keys[i];
 		new_leaf->num_keys++;
 	}
 
 	free(temp_pointers);
+	free(temp_pointers_disk);
 	free(temp_keys);
 
 	new_leaf->pointers[order - 1] = leaf->pointers[order - 1];
+	new_leaf->pointers_disk[order - 1] = leaf->pointers_disk[order - 1];
 	leaf->pointers[order - 1] = new_leaf;
 
 	for (i = leaf->num_keys; i < order - 1; i++)
@@ -950,7 +972,12 @@ node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, nod
 	new_leaf->parent = leaf->parent;
 	new_key = new_leaf->keys[0];
 
-	return insert_into_parent(root, leaf, new_key, new_leaf);
+	leaf_disk = initialize_disknode_from_node(io, leaf, false);
+	new_leaf_disk = initialize_disknode_from_node(io, new_leaf, false);
+	leaf->pointers_disk[order - 1] = new_leaf_disk;
+	root = insert_into_parent(io, root, leaf, new_key, new_leaf, leaf_disk, new_leaf_disk);
+	initialize_disknode_from_node(io, root, true);
+	return root;
 }
 
 
@@ -958,17 +985,20 @@ node * insert_into_leaf_after_splitting(struct dm_crypt_io *io, node * root, nod
  * into a node into which these can fit
  * without violating the B+ tree properties.
  */
-node * insert_into_node(node * root, node * n, 
-		int left_index, int key, node * right) {
+node * insert_into_node(struct dm_crypt_io *io, node * root, node * n, 
+		int left_index, int key, node * right, unsigned left_disk, unsigned right_disk) {
 	int i;
 
 	for (i = n->num_keys; i > left_index; i--) {
 		n->pointers[i + 1] = n->pointers[i];
+		n->pointers_disk[i + 1] = n->pointers_disk[i];
 		n->keys[i] = n->keys[i - 1];
 	}
 	n->pointers[left_index + 1] = right;
+	n->pointers_disk[left_index + 1] = right_disk;
 	n->keys[left_index] = key;
 	n->num_keys++;
+	initialize_disknode_from_node(io, n, false);
 	return root;
 }
 
@@ -977,13 +1007,15 @@ node * insert_into_node(node * root, node * n,
  * into a node, causing the node's size to exceed
  * the order, and causing the node to split into two.
  */
-node * insert_into_node_after_splitting(node * root, node * old_node, int left_index, 
-		int key, node * right) {
+node * insert_into_node_after_splitting(struct dm_crypt_io *io, node * root, node * old_node, int left_index, 
+		int key, node * right, unsigned right_disk) {
 
 	int i, j, split, k_prime;
 	node * new_node, * child;
 	int * temp_keys;
-	node ** temp_pointers;
+	node ** temp_pointers, 
+	unsigned * temp_pointers_disk;
+	unsigned old_disk, new_disk;
 
 	/* First create a temporary set of keys and pointers
 	 * to hold everything in order, including
@@ -998,6 +1030,10 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 	if (temp_pointers == NULL) {
 		printk("Temporary pointers array for splitting nodes.");
 	}
+        temp_pointers_disk = malloc((order + 1) * sizeof(unsigned));
+        if (temp_pointers == NULL) {
+                printk("Temporary pointers array for splitting nodes.");
+        }
 	temp_keys = malloc(order * sizeof(int));
 	if (temp_keys == NULL) {
 		printk("Temporary keys array for splitting nodes.");
@@ -1006,6 +1042,7 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 	for (i = 0, j = 0; i < old_node->num_keys + 1; i++, j++) {
 		if (j == left_index + 1) j++;
 		temp_pointers[j] = old_node->pointers[i];
+		temp_pointers_disk[j] = old_node->pointers_disk[i];
 	}
 
 	for (i = 0, j = 0; i < old_node->num_keys; i++, j++) {
@@ -1014,6 +1051,7 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 	}
 
 	temp_pointers[left_index + 1] = right;
+	temp_pointers_disk[left_index + 1] = right_disk;
 	temp_keys[left_index] = key;
 
 	/* Create the new node and copy
@@ -1025,6 +1063,7 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 	old_node->num_keys = 0;
 	for (i = 0; i < split - 1; i++) {
 		old_node->pointers[i] = temp_pointers[i];
+		old_node->pointers_disk[i] = temp_pointers_disk[i];
 		old_node->keys[i] = temp_keys[i];
 		old_node->num_keys++;
 	}
@@ -1032,13 +1071,16 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 	k_prime = temp_keys[split - 1];
 	for (++i, j = 0; i < order; i++, j++) {
 		new_node->pointers[j] = temp_pointers[i];
+		new_node->pointers_disk[j] = temp_pointers_disk[i];
 		new_node->keys[j] = temp_keys[i];
 		new_node->num_keys++;
 	}
 	new_node->pointers[j] = temp_pointers[i];
 	free(temp_pointers);
+	free(temp_pointers_disk);
 	free(temp_keys);
 	new_node->parent = old_node->parent;
+	new_node->parent_disk = old_node->parent_disk;
 	for (i = 0; i <= new_node->num_keys; i++) {
 		child = new_node->pointers[i];
 		child->parent = new_node;
@@ -1049,7 +1091,10 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 	 * the old node to the left and the new to the right.
 	 */
 
-	return insert_into_parent(root, old_node, k_prime, new_node);
+        old_disk = initialize_disknode_from_node(io, old_node, false);
+        new_disk = initialize_disknode_from_node(io, new_node, false);
+
+	return insert_into_parent(io, root, old_node, k_prime, new_node, old_disk, new_disk);
 }
 
 
@@ -1057,7 +1102,7 @@ node * insert_into_node_after_splitting(node * root, node * old_node, int left_i
 /* Inserts a new node (leaf or internal node) into the B+ tree.
  * Returns the root of the tree after insertion.
  */
-node * insert_into_parent(node * root, node * left, int key, node * right) {
+node * insert_into_parent(struct dm_crypt_io *io, node * root, node * left, int key, node * right, unsigned left_disk, unsigned right_disk) {
 
 	int left_index;
 	node * parent;
@@ -1067,7 +1112,7 @@ node * insert_into_parent(node * root, node * left, int key, node * right) {
 	/* Case: new root. */
 
 	if (parent == NULL)
-		return insert_into_new_root(left, key, right);
+		return insert_into_new_root(left, key, right, left_disk, right_disk);
 
 	/* Case: leaf or node. (Remainder of
 	 * function body.)  
@@ -1084,13 +1129,13 @@ node * insert_into_parent(node * root, node * left, int key, node * right) {
 	 */
 
 	if (parent->num_keys < order - 1)
-		return insert_into_node(root, parent, left_index, key, right);
+		return insert_into_node(io, root, parent, left_index, key, right, left_disk, right_disk);
 
 	/* Harder case:  split a node in order 
 	 * to preserve the B+ tree properties.
 	 */
 
-	return insert_into_node_after_splitting(root, parent, left_index, key, right);
+	return insert_into_node_after_splitting(io, root, parent, left_index, key, right);
 }
 
 
@@ -1098,13 +1143,15 @@ node * insert_into_parent(node * root, node * left, int key, node * right) {
  * and inserts the appropriate key into
  * the new root.
  */
-node * insert_into_new_root(node * left, int key, node * right) {
+node * insert_into_new_root(node * left, int key, node * right, unsigned left_disk, unsigned right_disk) {
 
 	node * root = make_node();
 	root->keys[0] = key;
 	root->pointers[0] = left;
+	root->pointers_disk[0] = left_disk;
 	root->pointers_expanded[0] = true;
 	root->pointers[1] = right;
+	root->pointers_disk[1] = right_disk;
 	root->pointers_expanded[1] = true;
 	root->num_keys++;
 	root->parent = NULL;
@@ -1122,7 +1169,8 @@ node * start_new_tree(struct dm_crypt_io *io, int key, record * pointer) {
 
 	node * root = make_leaf();
 	root->keys[0] = key;
-	root->pointers[0] = pointer->value;
+	root->pointers[0] = pointer;
+	root->pointers_disk[0] = pointer->value;
 	root->pointers[order - 1] = NULL;
 	root->parent = NULL;
 	root->num_keys++;
@@ -1157,7 +1205,7 @@ node * insert(struct dm_crypt_io *io, node * root, int key, int value) {
 		 * the value and return the tree.
 		 */
 		printk("Key %d already in map. Refreshing it", key);
-		//record_pointer->value = value;
+		record_pointer->value = value;
 		initialize_disknode_from_node(io, key_leaf, key_leaf == root);
 		return root;
 	}
@@ -1629,16 +1677,16 @@ void initialize_node_from_disknode(struct dm_crypt_io *io, int sector, node *nod
         }
 	offset = 0;
 	for (i = 0; i < order-2; i+=2) {
-		memcpy(&node->pointers[i], node_data + offset + 4, 4);
-		memcpy(&node->pointers[i+1], node_data + offset + 8, 4);
+		memcpy(&node->pointers_disk[i], node_data + offset + 4, 4);
+		memcpy(&node->pointers_disk[i+1], node_data + offset + 8, 4);
 		offset += 16;
 	}
-	memcpy(&node->pointers[i], node_data + offset + 2, 4);
-	memcpy(&node->pointers[i+1], node_data + offset + 6, 4);
-	memcpy(&node->parent, node_data + offset + 10, 4);
+	memcpy(&node->pointers_disk[i], node_data + offset + 2, 4);
+	memcpy(&node->pointers_disk[i+1], node_data + offset + 6, 4);
+	memcpy(&node->parent_disk, node_data + offset + 10, 4);
 }
 
-void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root)
+unsigned initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_root)
 {
         unsigned char node_data[NODE_SIZE];
         unsigned int i;
@@ -1665,9 +1713,9 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_r
                 memcpy(node_data + offset + 8, &node->pointers[i+1], 4);
                 offset += 16;
         }
-        memcpy(node_data + offset + 2, &node->pointers[i], 4);
-        memcpy(node_data + offset + 6, &node->pointers[i+1], 4);
-        memcpy(node_data + offset + 10, &node->parent, 4);
+        memcpy(node_data + offset + 2, &node->pointers_disk[i], 4);
+        memcpy(node_data + offset + 6, &node->pointers_disk[i+1], 4);
+        memcpy(node_data + offset + 10, &node->parent_disk, 4);
 
 	offset = 0;
 	for (i = 0; i < IV_PER_NODE; i++) {
@@ -1685,11 +1733,12 @@ void initialize_disknode_from_node(struct dm_crypt_io *io, node *node, bool is_r
 		if(getfrom_freelist(IV_PER_NODE, results)) {
 			printk("Unable to find %d public sectors for hidden write", IV_PER_NODE);
         		crypt_dec_pending(io);
-			return;
+			return -1;
 		}
 	}
         rdwr_sector_metadata(io, REQ_OP_WRITE, results[0].start, node_data, NODE_SIZE);
         crypt_dec_pending(io);
+	return results[0].start;
 }
 
 struct node * initialize_root(struct dm_crypt_io *io)
