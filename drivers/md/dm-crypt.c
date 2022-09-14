@@ -2200,10 +2200,11 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
 			int j = 0;
+			unsigned lsector = io->base_bio->bi_iter.bi_sector;
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 				if(getfrom_freelist(num_sectors, io->freelist[i])) {
-					printk("Unable to find %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
+					printk("kcryptd_io_read Unable to find %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
 					crypt_dec_pending(io);
 					io->error = BLK_STS_IOERR;	
 					return 1;
@@ -2211,7 +2212,12 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			}
 			// read list of sectors from B Tree
 			else {
-		
+				if(map_find(io, lsector, io->freelist[i], num_sectors)) {
+                                        printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
+                                        crypt_dec_pending(io);
+                                        io->error = BLK_STS_IOERR;
+                                        return 1;
+                                }
 
 			}
 			//TODO: club adjacent sectors to increase performance
@@ -2245,8 +2251,9 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
 				prev = bio;
 				tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
-				j++;
+				j+= io->freelist[i][j].len;
 			}
+			lsector++;
 		}
 		clone = bio;
 	}

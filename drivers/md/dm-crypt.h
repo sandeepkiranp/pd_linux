@@ -184,3 +184,5 @@ int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int off
 int getfrom_freelist(int sector_count, struct freelist_results *results);
 
 void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results *res);
+
+int map_find(struct dm_crypt_io *io, unsigned lsector, struct freelist_results *res, int num_sectors);

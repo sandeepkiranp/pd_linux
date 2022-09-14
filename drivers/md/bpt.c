@@ -746,6 +746,37 @@ record * find(struct dm_crypt_io *io, node * root, int key, bool verbose, node *
 		return (record *)leaf->pointers[i];
 }
 
+unsigned find_value(struct dm_crypt_io *io, node * root, int key, bool verbose, node ** leaf_out) {
+        if (root == NULL) {
+                if (leaf_out != NULL) {
+                        *leaf_out = NULL;
+                }
+                return -1;
+        }
+
+        int i = 0;
+        node * leaf = NULL;
+
+        leaf = find_leaf(io, root, key, verbose);
+
+        /* If root != NULL, leaf must have a value, even
+         * if it does not contain the desired key.
+         * (The leaf holds the range of keys that would
+         * include the desired key.)
+         */
+
+        for (i = 0; i < leaf->num_keys; i++)
+                if (leaf->keys[i] == key) break;
+        if (leaf_out != NULL) {
+                *leaf_out = leaf;
+        }
+        if (i == leaf->num_keys)
+                return -1;
+        else
+                return leaf->pointers_disk[i];
+}
+
+
 record * find_update(struct dm_crypt_io *io, node * root, int key, bool verbose, node ** leaf_out, int value) {
         if (root == NULL) {
                 if (leaf_out != NULL) {
@@ -1786,6 +1817,29 @@ void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results
 
 	root = insert(io, root, sector, res[0].start);
 	//initialize_root(io);
+}
+
+int map_find(struct dm_crypt_io *io, unsigned lsector, struct freelist_results *res, int num_sectors)
+{
+        printk("Inside map_find logical sector %d", lsector);
+        if (root == NULL) {
+                root = initialize_root(io);
+        }
+	if (root == NULL) {
+		printk("Error initializing map root");
+		return -1;
+	}
+        unsigned psector = find_value(io, root, lsector, false, NULL);
+        if (psector == -1) {
+                printk("Inside map_find, unable to find mapping for sector %d.\n", lsector);
+		return -1;
+	}
+        else {
+                printk("Logical Sector %d, Physical Sector %d.\n", lsector, psector);
+		res[0].start = psector;
+		res[0].len = num_sectors;
+	}
+	return 0;
 }
 
 /*
