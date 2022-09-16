@@ -119,7 +119,7 @@ static bool crypt_integrity_aead(struct crypt_config *cc);
 
 struct file *bio_file = NULL;
 
-#define printk(f_, ...) 
+//#define printk(f_, ...) 
 
 void print_integrity_metadata(char *msg, char *data)
 {
@@ -2185,6 +2185,8 @@ int map_insert(unsigned sector, unsigned value)
 	idr_preload(GFP_KERNEL);
 	unsigned lvalue = (!value) ? INT_MAX : value;
 
+	printk("map_insert, Inserting key %d, value %d", sector, lvalue);
+
 	spin_lock(&map_lock);
 	//check if key already exists. If so, remove it.
 	if (NULL != idr_find(&map_idr, sector)) 
@@ -2207,8 +2209,10 @@ int map_find(unsigned sector)
 
 	if (!value)
 		return -1;
-	else
+	else {
+		printk("map_find, retrieved key %d, value %d", sector, (value == INT_MAX) ? 0 : value);
         	return (value == INT_MAX) ? 0 : value;
+	}
 }
 
 static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
@@ -2225,6 +2229,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 		unsigned rem_size = size;
 		int tag_idx = 0;
 		int i, j;
+		unsigned lsector = io->base_bio->bi_iter.bi_sector;
 
 		io->freelist = kmalloc(bio_sectors(io->base_bio) * sizeof(io->freelist), GFP_KERNEL);
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
@@ -2235,7 +2240,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
 			int j = 0;
-			unsigned lsector = io->base_bio->bi_iter.bi_sector;
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 				if(getfrom_freelist(num_sectors, io->freelist[i])) {
@@ -2245,20 +2249,18 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 					return 1;
 				}
 			}
-			// read list of sectors from B Tree
+			// read list of sectors from map
 			else {
 				//assuming that we have num_sectors in freelist[i][0]
 				if((io->freelist[i][0].start = map_find(lsector)) == -1) {
                                         printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
-                                        crypt_dec_pending(io);
-                                        io->error = BLK_STS_IOERR;
-                                        return 1;
+                                        return -1;
                                 }
 				io->freelist[i][0].len = num_sectors;				
 			}
 			//TODO: club adjacent sectors to increase performance
-			printk("Iterating through freelist results [%d][%d] start %d, len %d\n", i, j, io->freelist[i][j].start, io->freelist[i][j].len);
 			while(j < num_sectors && io->freelist[i][j].len) {
+				printk("Iterating through freelist results [%d][%d] start %d, len %d\n", i, j, io->freelist[i][j].start, io->freelist[i][j].len);
 				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
 				printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
        		         	bio = crypt_alloc_buffer(io, assigned, tag_idx);
@@ -2343,7 +2345,8 @@ static void kcryptd_io_rdwr_map(struct work_struct *work)
         if (!io->freelist)
             goto ret;
         for(i = 0; i < bio_sectors(io->base_bio); i++) {
-            map_insert(sector, io->freelist[i][0].start);
+            if (map_insert(sector, io->freelist[i][0].start))
+		    printk("kcryptd_io_rdwr_map, error inserting key %d, value %d into map", sector, io->freelist[i][0].start);
 	    sector++;
         }
 ret:
@@ -2354,9 +2357,12 @@ ret:
 static void kcryptd_io_read_work(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+	int ret;
 
 	crypt_inc_pending(io);
-	if (kcryptd_io_read(io, GFP_NOIO))
+	ret = kcryptd_io_read(io, GFP_NOIO);
+	if (ret == -1) {}
+	else if (ret)
 		io->error = BLK_STS_RESOURCE;
 	crypt_dec_pending(io);
 }
@@ -4351,11 +4357,12 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	else
 		io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
-
+/*
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (bio_data_dir(bio) != WRITE)) {
 		bio_endio(io->base_bio);
 		return DM_MAPIO_SUBMITTED;	
 	}
+*/	
 
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))
