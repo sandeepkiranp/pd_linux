@@ -165,7 +165,7 @@ struct freelist_results {
         unsigned start;
         int len;
 };
-
+/*
 struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size, int integ_offset);
 void crypt_convert_init(struct crypt_config *cc,
                                struct convert_context *ctx,
@@ -186,3 +186,4 @@ int getfrom_freelist(int sector_count, struct freelist_results *results);
 void map_insert(struct dm_crypt_io *io, unsigned sector, struct freelist_results *res);
 
 int map_find(struct dm_crypt_io *io, unsigned lsector, struct freelist_results *res, int num_sectors);
+*/

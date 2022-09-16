@@ -37,8 +37,8 @@ faulty-y	+= md-faulty.o
 # and must come before md.o, as they each initialise 
 # themselves, and md.o may use the personalities when it 
 # auto-initialised.
-obj-m += dm_crypt.o
-dm_crypt-objs := dm-crypt.o bpt.o
+#obj-m += dm_crypt.o
+#dm_crypt-objs := dm-crypt.o bpt.o
 
 obj-$(CONFIG_MD_LINEAR)		+= linear.o
 obj-$(CONFIG_MD_RAID0)		+= raid0.o
@@ -58,7 +58,7 @@ obj-$(CONFIG_BLK_DEV_DM_BUILTIN) += dm-builtin.o
 obj-$(CONFIG_DM_UNSTRIPED)	+= dm-unstripe.o
 obj-$(CONFIG_DM_BUFIO)		+= dm-bufio.o
 obj-$(CONFIG_DM_BIO_PRISON)	+= dm-bio-prison.o
-#obj-$(CONFIG_DM_CRYPT)		+= dm-crypt.o bpt.o
+obj-$(CONFIG_DM_CRYPT)		+= dm-crypt.o
 obj-$(CONFIG_DM_DELAY)		+= dm-delay.o
 obj-$(CONFIG_DM_DUST)		+= dm-dust.o
 obj-$(CONFIG_DM_FLAKEY)		+= dm-flakey.o

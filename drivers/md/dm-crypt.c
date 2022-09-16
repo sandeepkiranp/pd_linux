@@ -45,11 +45,16 @@
 #include <asm/segment.h>
 #include <asm/uaccess.h>
 #include <linux/buffer_head.h>
+#include <linux/idr.h>
 
 #include "dm-audit.h"
 #include "dm-crypt.h"
 
 #define DM_MSG_PREFIX "crypt"
+
+static DEFINE_IDR(map_idr);
+
+static DEFINE_SPINLOCK(map_lock);
 
 struct dm_crypt_request {
 	struct convert_context *ctx;
@@ -2174,7 +2179,37 @@ static void io_add_bio_vec(struct dm_crypt_io *io, struct bio_vec *bv)
 	io->pages_tail = temp;
 }
 
+int map_insert(unsigned sector, unsigned value)
+{
+	int r;
+	idr_preload(GFP_KERNEL);
+	unsigned lvalue = (!value) ? INT_MAX : value;
 
+	spin_lock(&map_lock);
+	//check if key already exists. If so, remove it.
+	if (NULL != idr_find(&map_idr, sector)) 
+		idr_remove(&map_idr, sector);
+
+	r = idr_alloc(&map_idr, (void *)lvalue, sector, sector + 1, GFP_NOWAIT);
+
+	spin_unlock(&map_lock);
+	idr_preload_end();
+	if (r < 0)
+		return r == -ENOSPC ? -EBUSY : r;
+	return 0;
+}
+
+int map_find(unsigned sector)
+{
+	spin_lock(&map_lock);
+	unsigned value = (int)idr_find(&map_idr, sector);
+	spin_unlock(&map_lock);
+
+	if (!value)
+		return -1;
+	else
+        	return (value == INT_MAX) ? 0 : value;
+}
 
 static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 {
@@ -2212,13 +2247,14 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			}
 			// read list of sectors from B Tree
 			else {
-				if(map_find(io, lsector, io->freelist[i], num_sectors)) {
+				//assuming that we have num_sectors in freelist[i][0]
+				if((io->freelist[i][0].start = map_find(lsector)) == -1) {
                                         printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
                                         crypt_dec_pending(io);
                                         io->error = BLK_STS_IOERR;
                                         return 1;
                                 }
-
+				io->freelist[i][0].len = num_sectors;				
 			}
 			//TODO: club adjacent sectors to increase performance
 			printk("Iterating through freelist results [%d][%d] start %d, len %d\n", i, j, io->freelist[i][j].start, io->freelist[i][j].len);
@@ -2251,7 +2287,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
 				prev = bio;
 				tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
-				j+= io->freelist[i][j].len;
+				j++;
 			}
 			lsector++;
 		}
@@ -2296,7 +2332,6 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	return 0;
 }
 
-
 static void kcryptd_io_rdwr_map(struct work_struct *work)
 {
 	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
@@ -2308,7 +2343,7 @@ static void kcryptd_io_rdwr_map(struct work_struct *work)
         if (!io->freelist)
             goto ret;
         for(i = 0; i < bio_sectors(io->base_bio); i++) {
-            map_insert(io, sector, io->freelist[i]);
+            map_insert(sector, io->freelist[i][0].start);
 	    sector++;
         }
 ret:
@@ -3574,6 +3609,8 @@ static void crypt_dtr(struct dm_target *ti)
 	spin_unlock(&dm_crypt_clients_lock);
 
 	dm_audit_log_dtr(DM_MSG_PREFIX, ti, 1);
+
+	idr_destroy(&map_idr);
 }
 
 static int crypt_ctr_ivmode(struct dm_target *ti, const char *ivmode)
@@ -4229,8 +4266,6 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
-
-	//map_ctr(num_sectors);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
