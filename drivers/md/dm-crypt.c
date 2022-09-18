@@ -187,7 +187,7 @@ void print_bio(char *msg, struct bio *bio)
 	    p = kasprintf(GFP_KERNEL, "\n\nprint_bio, %s, total bio size %d, starting sector %d, num of sectors %d\n", msg, iter_out.bi_size, iter_out.bi_sector, bio_sectors(bio));
 	    kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
             while (iter_out.bi_size) {
-            	p = kasprintf(GFP_KERNEL, "remaining size %d, current sector %d\n", iter_out.bi_size, iter_out.bi_sector);
+            	p = kasprintf(GFP_KERNEL, "\nremaining size %d, current sector %d\n", iter_out.bi_size, iter_out.bi_sector);
 	    	kernel_write(bio_file, p, strlen(p), &bio_file->f_pos); 
 		unsigned size = min_t(unsigned, 512, iter_out.bi_size);
                 struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
@@ -2070,7 +2070,7 @@ static void crypt_endio(struct bio *clone)
 		                struct bio *bio = crypt_alloc_buffer(io, size, 0);
 
 				io->write_sector = io->sector;
-				io->sector = io->read_sector;
+				io->sector = num_sectors * io->sector;
 
 		                if (unlikely(!bio)) {
 		                        io->error = BLK_STS_IOERR;
@@ -2091,7 +2091,8 @@ static void crypt_endio(struct bio *clone)
 					offset += cc->on_disk_tag_size;
 				}
 
-				//print_bio("Inside crypt_endio", bio);
+				if (io->base_bio->bi_iter.bi_sector == 0)
+					print_bio("Inside crypt_endio, hidden read", bio);
 
 				//print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
 				//print_bio("Inside crypt_endio", io->base_bio);
@@ -2254,7 +2255,10 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				//assuming that we have num_sectors in freelist[i][0]
 				if((io->freelist[i][0].start = map_find(lsector)) == -1) {
                                         printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
-                                        return -1;
+					printk("Mapping the input sector to itself just to continue the read");
+					//anyhow the data read will be junk. See if we can optimize this and not
+					//go through the entire decryption process for this sector and just return some random data
+					io->freelist[i][0].start = lsector;
                                 }
 				io->freelist[i][0].len = num_sectors;				
 			}
@@ -2271,7 +2275,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				bio->bi_opf = REQ_INTEGRITY | REQ_OP_READ;
 				bio->bi_private = NULL;
 				bio->bi_end_io = NULL;
-				bio->bi_iter.bi_sector = io->read_sector = cc->start + io->freelist[i][j].start; //TODO: fix io->read_sector
+				bio->bi_iter.bi_sector = cc->start + io->freelist[i][j].start;
 
 				if(prev) {
 					/* save pages of the prev bio in io and submit the prev bio */
@@ -2380,18 +2384,19 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
 	struct bio *clone = io->ctx.bio_out;
-	sector_t sector = io->sector;
 	struct bio *prev = NULL;
 	int tag_idx = 0;
+	sector_t sector = io->sector;
+	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
 	//printk("Entering kcryptd_io_write IO address %p, sector %d, clone sector %d, pages_head %p", io, sector, clone->bi_iter.bi_sector, io->pages_head);
         if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
-                        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
-                        int count = BIO_MAX_VECS;
+			unsigned int nr_iovecs = ((num_sectors * cc->sector_size) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+                        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
 
-			bio->bi_iter.bi_sector = sector;
+			bio->bi_iter.bi_sector = map_find(sector);
 		        bio->bi_private = NULL;
 		        bio->bi_end_io = NULL;
 			bio->bi_opf = REQ_OP_WRITE | REQ_INTEGRITY;
@@ -2408,12 +2413,12 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 				dm_submit_bio_remap(io->base_bio, prev);	
 			}
 
-                        while(count) {
+                        while(nr_iovecs) {
                                 bio_add_page(bio, temp->bv.bv_page, temp->bv.bv_len, temp->bv.bv_offset);
                                 temp = temp->next;
-                                count--;
+                                nr_iovecs--;
                         }
-                        sector += bio_sectors(bio);
+                        sector++;
 			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 			prev = bio;
                 }
@@ -2601,12 +2606,12 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
         if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
-                        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
                         int count = BIO_MAX_VECS;
+                        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
 
 			bio->bi_opf = REQ_OP_WRITE;
 
-                        while(count) {
+                        while(count && temp) {
                                 bio_add_page(bio, temp->bv.bv_page, temp->bv.bv_len, temp->bv.bv_offset);
                                 temp = temp->next;
                                 count--;
@@ -2701,7 +2706,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
                 io->flags |= PD_HIDDEN_OPERATION;
 
-		//print_bio("write_convert after randombytes and magic", clone);
+		print_bio("write_convert after randombytes and magic", clone);
 	}
 	else if (!(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                 printk("PD initiating READ during PUBLIC WRITE\n");
@@ -2757,6 +2762,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	 */
 	
 	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && !(io->flags & PD_READ_DURING_HIDDEN_WRITE)) {
+		print_bio("kcryptd_crypt_write_convert encrypted hidden data", io->ctx.bio_out);
 		printk("PD initiating READ during WRITE\n");
 		io->flags &= ~PD_HIDDEN_OPERATION;
 		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
