@@ -1283,7 +1283,7 @@ int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio, int off
 		return PTR_ERR(bip);
 
 	tag_len = io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
-	printk("Allocating bio_integrity_payload of size %d\n", tag_len);
+	//printk("Allocating bio_integrity_payload of size %d\n", tag_len);
 
 	bip->bip_iter.bi_size = tag_len;
 	bip->bip_iter.bi_sector = bio->bi_iter.bi_sector;
@@ -1865,7 +1865,7 @@ retry:
 
 	remaining_size = size;
 
-	printk("crypt_alloc_buffer nr_iovecs = %d, size = %d", nr_iovecs, size);
+	//printk("crypt_alloc_buffer nr_iovecs = %d, size = %d", nr_iovecs, size);
 
 	for (i = 0; i < nr_iovecs; i++) {
 		page = mempool_alloc(&cc->page_pool, gfp_mask);
@@ -1953,7 +1953,7 @@ void crypt_dec_pending(struct dm_crypt_io *io)
 	if (!atomic_dec_and_test(&io->io_pending))
 		return;
 
-	printk("crypt_dec_pending freeing stuff IO address %p", io);
+	//printk("crypt_dec_pending freeing stuff IO address %p", io);
 	if (io->ctx.r.req)
 		crypt_free_req(cc, io->ctx.r.req, base_bio);
 
@@ -2081,7 +2081,7 @@ static void crypt_endio(struct bio *clone)
 				// copy intergrity metadata to bio's memory pages
 				struct bvec_iter iter_out = bio->bi_iter;
 				unsigned offset = 0;
-				printk("Inside crypt_endio, before read %d, base bio size %d, size %d\n", iter_out.bi_size, io->base_bio->bi_iter.bi_size, size);
+				//printk("Inside crypt_endio, before read %d, base bio size %d, size %d\n", iter_out.bi_size, io->base_bio->bi_iter.bi_size, size);
 				while (iter_out.bi_size) {
        					struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
 					char *buffer = page_to_virt(bv_out.bv_page);
@@ -2125,7 +2125,7 @@ static void crypt_endio(struct bio *clone)
                         // copy intergrity metadata to bio's memory pages
                         struct bvec_iter iter_out = bio->bi_iter;
                         unsigned offset = 0;
-                        printk("Inside crypt_endio, before read %d, base bio size %d, size %d\n", iter_out.bi_size, io->base_bio->bi_iter.bi_size, size);
+                        //printk("Inside crypt_endio, before read %d, base bio size %d, size %d\n", iter_out.bi_size, io->base_bio->bi_iter.bi_size, size);
                         while (iter_out.bi_size) {
                                 struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                                 char *buffer = page_to_virt(bv_out.bv_page);
@@ -2254,8 +2254,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			else {
 				//assuming that we have num_sectors in freelist[i][0]
 				if((io->freelist[i][0].start = map_find(lsector)) == -1) {
-                                        printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
-					printk("Mapping the input sector to itself just to continue the read");
+                                        //printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
+					//printk("Mapping the input sector to itself just to continue the read");
 					//anyhow the data read will be junk. See if we can optimize this and not
 					//go through the entire decryption process for this sector and just return some random data
 					io->freelist[i][0].start = lsector;
@@ -2264,9 +2264,9 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			}
 			//TODO: club adjacent sectors to increase performance
 			while(j < num_sectors && io->freelist[i][j].len) {
-				printk("Iterating through freelist results [%d][%d] start %d, len %d\n", i, j, io->freelist[i][j].start, io->freelist[i][j].len);
+				//printk("Iterating through freelist results [%d][%d] start %d, len %d\n", i, j, io->freelist[i][j].start, io->freelist[i][j].len);
 				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
-				printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
+				//printk("kcryptd_io_read total size %d, rem_size %d, assigned size %d, tag_idx %d", size, rem_size, assigned, tag_idx);
        		         	bio = crypt_alloc_buffer(io, assigned, tag_idx);
        		         	if (unlikely(!bio)) {
        	                		io->error = BLK_STS_IOERR;
@@ -2286,11 +2286,11 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 						io_add_bio_vec(io, bv);
        		 			}
 
-					printk("chaining bio and submitting previous bio\n");
+					//printk("chaining bio and submitting previous bio\n");
 					bio_chain(prev, bio);
 					dm_submit_bio_remap(io->base_bio, prev);
 				}
-				printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
+				//printk("kcryptd_io_read chaining bio and submitting previous bio -COMPLETED, bio addr %p, bio sector %d\n", bio, bio->bi_iter.bi_sector);
 				prev = bio;
 				tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 				j++;
@@ -2332,8 +2332,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 	crypt_inc_pending(io);
 
-	printk("kcryptd_io_read Incoming sector %ld, incomign size %d, outgoing sector %ld, outgoing size %d", 
-			io->sector, io->base_bio->bi_iter.bi_size, clone->bi_iter.bi_sector, clone->bi_iter.bi_size);
+	//printk("kcryptd_io_read Incoming sector %ld, incomign size %d, outgoing sector %ld, outgoing size %d", 
+	//		io->sector, io->base_bio->bi_iter.bi_size, clone->bi_iter.bi_sector, clone->bi_iter.bi_size);
 	dm_submit_bio_remap(io->base_bio, clone);
 	return 0;
 }
@@ -2344,7 +2344,7 @@ static void kcryptd_io_rdwr_map(struct work_struct *work)
         int i, j;
         unsigned sector = io->base_bio->bi_iter.bi_sector;
 
-	printk("Inside kcryptd_io_rdwr_map %p\n", work);
+	//printk("Inside kcryptd_io_rdwr_map %p\n", work);
 
         if (!io->freelist)
             goto ret;
@@ -2375,7 +2375,7 @@ static void kcryptd_queue_read(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
 
-	printk("Inside kcryptd_queue_read");
+	//printk("Inside kcryptd_queue_read");
 	INIT_WORK(&io->work, kcryptd_io_read_work);
 	queue_work(cc->io_queue, &io->work);
 }
@@ -2389,7 +2389,7 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 	sector_t sector = io->sector;
 	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
-	//printk("Entering kcryptd_io_write IO address %p, sector %d, clone sector %d, pages_head %p", io, sector, clone->bi_iter.bi_sector, io->pages_head);
+	printk("Entering kcryptd_io_write IO address %p, sector %d, clone sector %d, pages_head %p", io, sector, clone->bi_iter.bi_sector, io->pages_head);
         if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
                 while(temp) {
@@ -2427,7 +2427,7 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 			dm_submit_bio_remap(io->base_bio, prev);
 		}
         }
-	printk("kcryptd_io_write submitting bio of size %d, starting sector %d\n", clone->bi_iter.bi_size, clone->bi_iter.bi_sector);
+	//printk("kcryptd_io_write submitting bio of size %d, starting sector %d\n", clone->bi_iter.bi_size, clone->bi_iter.bi_sector);
 	dm_submit_bio_remap(io->base_bio, clone);
 }
 
@@ -2503,7 +2503,7 @@ static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async)
 	/* crypt_convert should have filled the clone bio */
 	//BUG_ON(io->ctx.iter_out.bi_size);
 
-	clone->bi_iter.bi_sector = cc->start + io->sector;
+	//clone->bi_iter.bi_sector = cc->start + io->sector;
 
 	if ((likely(!async) && test_bit(DM_CRYPT_NO_OFFLOAD, &cc->flags)) ||
 	    test_bit(DM_CRYPT_NO_WRITE_WORKQUEUE, &cc->flags)) {
@@ -2685,7 +2685,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 		    }
 		    /* Hiddenbytes | Sector Num | Sector Offset | RandomBytes | Magic */
-		    printk("kcryptd_crypt_write_convert, logical sector number %d, sector offset %d\n", sector_num, sector_offset);
+		    //printk("kcryptd_crypt_write_convert, logical sector number %d, sector offset %d\n", sector_num, sector_offset);
 		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);//TODO: check if sector number increments
 		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sector_offset, SECTOR_OFFSET_LEN);
 		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN, RANDOM_BYTES_PER_TAG);
@@ -2745,7 +2745,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	if (r)
 		io->error = r;
 	crypt_finished = atomic_dec_and_test(&ctx->cc_pending);
-	printk("kcryptd_crypt_write_convert, finished encrypting input, finished = %d, integrity metadata payload %p\n", crypt_finished, bio_integrity(io->ctx.bio_out));
+	//printk("kcryptd_crypt_write_convert, finished encrypting input, finished = %d, integrity metadata payload %p\n", crypt_finished, bio_integrity(io->ctx.bio_out));
 	if (!crypt_finished && kcryptd_crypt_write_inline(cc, ctx)) {
 		/* Wait for completion signaled by kcryptd_async_done() */
 		wait_for_completion(&ctx->restart);
@@ -2774,13 +2774,14 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags & PD_READ_DURING_HIDDEN_WRITE)) {
                                 io->base_bio = io->write_bio;
-                                printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
+                                printk("restored base bio. before submitting out size %d, base io size %d, sector %d\n", 
+						io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size, io->ctx.bio_out->bi_iter.bi_sector);
                                 kcryptd_crypt_write_io_submit(io, 0);
                                 crypt_dec_pending(io);
                                 return;
         }
         if (crypt_finished && (io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
-                                printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
+                                //printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
                                 kcryptd_crypt_write_io_submit(io, 0);
                                 crypt_dec_pending(io);
                                 return;
@@ -2827,7 +2828,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	unsigned int tag_offset = 0;
 	sector_t sector = io->sector;
 	int tag_idx = 0;
-        printk("Inside kcryptd_crypt_read_convert, IO address %p, decrypting %d bytes, starting sector %d\n", io, io->base_bio->bi_iter.bi_size, io->base_bio->bi_iter.bi_sector);
+        //printk("Inside kcryptd_crypt_read_convert, IO address %p, decrypting %d bytes, starting sector %d\n", io, io->base_bio->bi_iter.bi_size, io->base_bio->bi_iter.bi_sector);
 
 	crypt_inc_pending(io);
 
@@ -2875,13 +2876,16 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (atomic_dec_and_test(&io->ctx.cc_pending))
 		kcryptd_crypt_read_done(io);
 
-	// Hidden read read only.
+	// Hidden read only.
 	if (io->flags & PD_HIDDEN_OPERATION && !(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
 		unsigned total_copied = 0;
 		/* restore base bio */
 		io->base_bio = io->write_bio;
-		printk("Inside kcryptd_crypt_read_convert, copying decrypted hiden data to input. hidden data size %d, input size %d\n",
-				io->ctx.bio_out->bi_iter.bi_size, io->base_bio->bi_iter.bi_size); 
+                if (io->base_bio->bi_iter.bi_sector == 0)
+                    print_bio("Inside io_read, decrypted hidden data", io->ctx.bio_out);
+
+		//printk("Inside kcryptd_crypt_read_convert, copying decrypted hiden data to input. hidden data size %d, input size %d\n",
+		//		io->ctx.bio_out->bi_iter.bi_size, io->base_bio->bi_iter.bi_size); 
                 struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
                 struct bvec_iter iter_out = io->base_bio->bi_iter;
                 while (iter_out.bi_size) {
