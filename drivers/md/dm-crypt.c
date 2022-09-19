@@ -245,7 +245,7 @@ void addto_freelist(unsigned sector)
 	prev->next = node;
 unlock:
 	total_freelist++;
-	printk("addto_freelist, added %d, total elements in freelist %d\n", sector, total_freelist);
+	//printk("addto_freelist, added %d, total elements in freelist %d\n", sector, total_freelist);
 	//UNLOCK
 	return;
 }
@@ -363,6 +363,7 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
 		printk("getfrom_freelist Found only %d free sectors out of required %d sectors. Restoring back\n", current_sector_count, sector_count);
 		int i = 0, j = 0;
 		while(results[i].start) {
+			printk("Adding %d sectors from %d to freelist", results[i].len, results[i].start);
 			for(j = results[i].start; j < results[i].start + results[i].len; j++)
 				addto_freelist(j);
 			i++;
@@ -2386,17 +2387,18 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 	struct bio *clone = io->ctx.bio_out;
 	struct bio *prev = NULL;
 	int tag_idx = 0;
-	sector_t sector = io->sector;
+	sector_t sector = io->base_bio->bi_iter.bi_sector;
 	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
 	printk("Entering kcryptd_io_write IO address %p, sector %d, clone sector %d, pages_head %p", io, sector, clone->bi_iter.bi_sector, io->pages_head);
         if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
                 struct io_bio_vec *temp = io->pages_head;
+		int i = 0;
                 while(temp) {
 			unsigned int nr_iovecs = ((num_sectors * cc->sector_size) + PAGE_SIZE - 1) >> PAGE_SHIFT;
                         struct bio *bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
 
-			bio->bi_iter.bi_sector = map_find(sector);
+			bio->bi_iter.bi_sector = io->freelist[i][0].start;
 		        bio->bi_private = NULL;
 		        bio->bi_end_io = NULL;
 			bio->bi_opf = REQ_OP_WRITE | REQ_INTEGRITY;
@@ -2407,18 +2409,19 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 				//TODO: handle this gracefully
 		        }
 
-			if (prev) {
-				bio_chain(prev, bio);
-				//printk("kcryptd_io_write submitting bio size %d , starting sector %d\n", prev->bi_iter.bi_size, prev->bi_iter.bi_sector);
-				dm_submit_bio_remap(io->base_bio, prev);	
-			}
-
                         while(nr_iovecs) {
                                 bio_add_page(bio, temp->bv.bv_page, temp->bv.bv_len, temp->bv.bv_offset);
                                 temp = temp->next;
                                 nr_iovecs--;
                         }
-                        sector++;
+
+			if (prev) {
+				bio_chain(prev, bio);
+				printk("kcryptd_io_write submitting bio size %d , starting sector %d\n", prev->bi_iter.bi_size, prev->bi_iter.bi_sector);
+				dm_submit_bio_remap(io->base_bio, prev);	
+			}
+
+                        i++;
 			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
 			prev = bio;
                 }
@@ -2427,7 +2430,7 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 			dm_submit_bio_remap(io->base_bio, prev);
 		}
         }
-	//printk("kcryptd_io_write submitting bio of size %d, starting sector %d\n", clone->bi_iter.bi_size, clone->bi_iter.bi_sector);
+	printk("kcryptd_io_write submitting bio of size %d, starting sector %d\n", clone->bi_iter.bi_size, clone->bi_iter.bi_sector);
 	dm_submit_bio_remap(io->base_bio, clone);
 }
 
@@ -2608,6 +2611,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                 while(temp) {
                         int count = BIO_MAX_VECS;
                         struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
+			int actual = 0;
 
 			bio->bi_opf = REQ_OP_WRITE;
 
@@ -2615,6 +2619,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                                 bio_add_page(bio, temp->bv.bv_page, temp->bv.bv_len, temp->bv.bv_offset);
                                 temp = temp->next;
                                 count--;
+				actual++;
                         }
                         crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 
@@ -2625,6 +2630,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         sector += bio_sectors(bio);
 			tag_idx +=  io->cc->on_disk_tag_size * (bio_sectors(bio) >> io->cc->sector_shift);
                         bio_put(bio);
+			printk("kcryptd_crypt_read_convert, encrypted %d pages from pages_head", actual);
                 }
 		// if we use the same bio for read and write, it somehow results in crash in submit_bio_noacct
 		// Therefore, we are resetting the bio before submitting again
@@ -2838,14 +2844,17 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 while(temp) {
                         struct bio *bio = bio_alloc_bioset(cc->dev->bdev, BIO_MAX_VECS, REQ_OP_READ, GFP_NOIO, &cc->bs);
                         int count = BIO_MAX_VECS;
+			int actual = 0;
 
 			bio->bi_opf = REQ_OP_READ;
 
-                        while(count) {
+                        while(count && temp) {
                                 bio_add_page(bio, temp->bv.bv_page, temp->bv.bv_len, temp->bv.bv_offset);
                                 temp = temp->next;
                                 count--;
+				actual++;
                         }
+
                         crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
 
                         r = crypt_convert(cc, &io->ctx,
@@ -2853,6 +2862,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                         if (r)
                                 io->error = r; //TODO: free everything and return failure
 			sector += bio_sectors(bio);
+			printk("kcryptd_crypt_read_convert, decrypted %d pages from pages_head", actual);
                         bio_put(bio);
                 }
         }
@@ -4066,7 +4076,6 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int ret, i;
 	size_t iv_size_padding, additional_req_size;
 	char dummy;
-	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
 	printk("device name %s, begin %d, len %d\n", devname, ti->begin, ti->len);
 	if (argc < 5) {
