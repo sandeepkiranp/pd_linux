@@ -98,7 +98,7 @@ enum cipher_flags {
 
 #define HIDDEN_BYTES_PER_TAG 9
 #define SECTOR_NUM_LEN       4
-#define SECTOR_OFFSET_LEN    1
+#define SEQUENCE_NUMBER_LEN    1
 #define RANDOM_BYTES_PER_TAG 1
 #define PD_MAGIC_DATA        0xAA
 
@@ -2184,36 +2184,47 @@ static void io_add_bio_vec(struct dm_crypt_io *io, struct bio_vec *bv)
 int map_insert(unsigned sector, unsigned value)
 {
 	int r;
+	unsigned seq_num = 0;
 	idr_preload(GFP_KERNEL);
-	unsigned lvalue = (!value) ? INT_MAX : value;
+	unsigned long complete = 0;
 
-	printk("map_insert, Inserting key %d, value %d", sector, lvalue);
 
 	spin_lock(&map_lock);
-	//check if key already exists. If so, remove it.
-	if (NULL != idr_find(&map_idr, sector)) 
+	//check if key already exists. If so, get existing sequence number and remove the key.
+	complete = (unsigned long)idr_find(&map_idr, sector);
+	if (complete) {
+		seq_num = complete >> 4;
 		idr_remove(&map_idr, sector);
-
-	r = idr_alloc(&map_idr, (void *)lvalue, sector, sector + 1, GFP_NOWAIT);
+	}
+	seq_num++;
+	complete = value | seq_num << 4;
+	r = idr_alloc(&map_idr, (void *)complete, sector, sector + 1, GFP_NOWAIT);
 
 	spin_unlock(&map_lock);
 	idr_preload_end();
 	if (r < 0)
 		return r == -ENOSPC ? -EBUSY : r;
+	printk("map_insert, Inserted key %d, value %d, seq_num %d, complete %ld", sector, value, seq_num, complete);
 	return 0;
 }
 
-int map_find(unsigned sector)
+int map_find(unsigned sector, int *seq_num)
 {
+	int value = 0;
+	int lseq_num = 0;
 	spin_lock(&map_lock);
-	unsigned value = (int)idr_find(&map_idr, sector);
+	unsigned long complete = (unsigned long)idr_find(&map_idr, sector);
 	spin_unlock(&map_lock);
 
-	if (!value)
+	if (!complete)
 		return -1;
 	else {
-		printk("map_find, retrieved key %d, value %d", sector, (value == INT_MAX) ? 0 : value);
-        	return (value == INT_MAX) ? 0 : value;
+		lseq_num = complete >> 4;
+		value = complete & 0xFFFFFFFF;
+		printk("map_find, retrieved key %d, value %d, seq_num %d, complete %ld", sector, value, lseq_num, complete);
+		if (seq_num)
+			*seq_num = lseq_num;
+        	return value;
 	}
 }
 
@@ -2254,7 +2265,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			// read list of sectors from map
 			else {
 				//assuming that we have num_sectors in freelist[i][0]
-				if((io->freelist[i][0].start = map_find(lsector)) == -1) {
+				if((io->freelist[i][0].start = map_find(lsector, NULL)) == -1) {
                                         //printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
 					//printk("Mapping the input sector to itself just to continue the read");
 					//anyhow the data read will be junk. See if we can optimize this and not
@@ -2673,6 +2684,9 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		    char *sbuffer = kmap_atomic(bv_in.bv_page);
                     char *dbuffer = page_to_virt(bv_out.bv_page);
 		    unsigned int sector_num = iter_in.bi_sector;
+		    unsigned int sequence_number;
+		    if (map_find(sector_num, &sequence_number) == -1)
+			    sequence_number = 1;
 		    unsigned copy_bytes = min_t(unsigned, HIDDEN_BYTES_PER_TAG, iter_in.bi_size);
 		    if (total_copied + copy_bytes > cc->sector_size)
 			    copy_bytes = cc->sector_size - total_copied; //always be on sector_size boundary 
@@ -2690,12 +2704,12 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                     else {
                         memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 		    }
-		    /* Hiddenbytes | Sector Num | Sector Offset | RandomBytes | Magic */
+		    /* Hiddenbytes | Sector Num | Sequence Number | RandomBytes | Magic */
 		    //printk("kcryptd_crypt_write_convert, logical sector number %d, sector offset %d\n", sector_num, sector_offset);
 		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);//TODO: check if sector number increments
-		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sector_offset, SECTOR_OFFSET_LEN);
-		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN, RANDOM_BYTES_PER_TAG);
-		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sequence_number, SEQUENCE_NUMBER_LEN);
+		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
+		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 
                     bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
                     bio_advance_iter(clone, &iter_out, cc->on_disk_tag_size);
@@ -2943,14 +2957,14 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
-			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
 				printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV\n");
 				//refresh the randomness	
-		                get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
+				get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
 			}
 			else {
 				printk("No hidden data present (magic %02hhx), generating random IV\n", 
-						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SECTOR_OFFSET_LEN + RANDOM_BYTES_PER_TAG]);
+						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG]);
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
 				addto_freelist(sector);
