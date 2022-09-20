@@ -252,128 +252,57 @@ unlock:
 
 int getfrom_freelist(int sector_count, struct freelist_results *results)
 {
-	if (!head_freelist)
-		return -1;
+       if (!head_freelist)
+                return -1;
         //LOCK
-        struct freelist *prev_x = NULL;
-        struct freelist *x = head_freelist;
-        struct freelist *y = head_freelist;
-        int l = 0;
-        struct freelist *prev_c_x = NULL;
-        struct freelist *c_x = head_freelist;
-        struct freelist *c_y = head_freelist->next;
-        int c_l = 1;
+        struct freelist *temp = head_freelist;
+        struct freelist *next = temp->next;
+        struct freelist *temp_prev = NULL;
         struct freelist *prev = head_freelist;
         unsigned current_sector_count = 0;
-        int i = 0;
+        int count = 1;
 
-	printk("getfrom_freelist, requested %d sectors from total of %d\n", sector_count, total_freelist);
 
-	if (c_y == NULL) { //there's only one node
-		if (sector_count != 1)
-			return -1;
-		results[i].start = head_freelist->sector;
-		results[i].len = 1;
-		head_freelist = NULL;
-		return 0;
-	}
-
-        while(current_sector_count != sector_count) {
-		l = 0;
-		c_l = 1;
-                while(c_y != NULL) {
-                        if (c_y->sector != prev->sector + 1) {
-                                if (c_l > l) {
-					prev_x = prev_c_x;
-                                        x = c_x;
-                                        y = prev;
-                                        l = c_l;
-                                }
-				prev_c_x = prev;
-                                c_x = prev = c_y;
-                                c_y = c_y->next;
-				c_l = 1;
-			}
-
-                        else {
-                                prev = c_y;
-                                c_y = c_y->next;
-                                c_l++;
-                                if (c_l == sector_count) {
-                                        results[0].start = c_x->sector;
-                                        results[0].len = sector_count;
-
-					struct freelist *temp = c_x;
-					struct freelist *next;
-					int count = 0;
-			                while(count != sector_count) {
-                        			next = temp->next;
-			                        kfree(temp);
-			                        temp = next;
-						count++;
-			                }
-			                if (prev_c_x == NULL) {
-                			        head_freelist = c_y;
-			                }
-			                else {
-                       	 			prev_c_x->next = c_y;
-				        }
-					total_freelist -= sector_count;
-                                        return 0;
-                                }
-                        }
+        //iterate through the list and find n contiguous sectors
+        while(temp != NULL && next != NULL) {
+                if (next->sector != temp->sector + count) {
+                        temp = prev = next;
+                        temp_prev = prev;
+                        next = temp->next;
+                        count = 1;
+                        continue;
+                }   
+                prev = next;
+                next = next->next;
+                count++;
+                if (count == sector_count)
+                        break;
+        }   
+        //UNLOCK
+        if(count != sector_count) {
+                printk("getfrom_freelist, found only %d free contiguous sectors out of required %d sectors. Restoring back\n", count, sector_count);
+                return -1; 
+        }   
+        else {
+        	printk("getfrom_freelist, requested %d sectors from total of %d, returning %d\n", sector_count, total_freelist, temp->sector);
+                results[0].start = temp->sector;
+                results[0].len = count;
+                // remove alloted nodes from freelist
+                prev = temp;
+                temp = temp->next;
+                while(prev != next) {
+                        kfree(prev);
+                        prev = temp;
+                        if (temp)
+                                temp = temp->next;
                 }
-		if (c_l > l) {
-			prev_x = prev_c_x;
-                	x = c_x;
-                        y = prev;
-                }
-
-        	results[i].start = x->sector;
-	        results[i].len = y->sector - x->sector + 1;
-        	i++;
-	        current_sector_count += y->sector - x->sector + 1;
-		struct freelist *temp = x;
-		struct freelist *next;
-		struct freelist *last = y->next;
-		while(temp != last) {
-			next = temp->next;
-			kfree(temp);
-			temp = next;
-		}
-		if (prev_x == NULL) {
-
-			head_freelist = next;	
-		}
-		else {
-			prev_x->next = next;
-
-		}
-		if (!head_freelist)
-			break;
-		// look for the next lengthiest sequence
-		c_x = head_freelist;
-		c_y = head_freelist->next;
-		prev = head_freelist;
-		prev_x = prev_c_x = NULL;
+                if (temp_prev)
+                        temp_prev->next = next;
+                else
+                        head_freelist = next; //move the head pointer
+                total_freelist -= sector_count;
+                return 0;
         }
-	//UNLOCK
-	if(current_sector_count != sector_count) {
-		//on failure, restore any sectors added to results
-		printk("getfrom_freelist Found only %d free sectors out of required %d sectors. Restoring back\n", current_sector_count, sector_count);
-		int i = 0, j = 0;
-		while(results[i].start) {
-			printk("Adding %d sectors from %d to freelist", results[i].len, results[i].start);
-			for(j = results[i].start; j < results[i].start + results[i].len; j++)
-				addto_freelist(j);
-			i++;
-		}
-		return -1;
-	}
-	else {
-		total_freelist -= sector_count;
-		return 0;
-	}
 }
 
 /*
@@ -2256,7 +2185,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 				if(getfrom_freelist(num_sectors, io->freelist[i])) {
-					printk("kcryptd_io_read Unable to find %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
+					printk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
 					crypt_dec_pending(io);
 					io->error = BLK_STS_IOERR;	
 					return 1;
@@ -2705,7 +2634,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                         memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 		    }
 		    /* Hiddenbytes | Sector Num | Sequence Number | RandomBytes | Magic */
-		    //printk("kcryptd_crypt_write_convert, logical sector number %d, sector offset %d\n", sector_num, sector_offset);
+		    printk("kcryptd_crypt_write_convert, logical sector number %d, sector sequence number %d\n", sector_num, sequence_number);
 		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);//TODO: check if sector number increments
 		    memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sequence_number, SEQUENCE_NUMBER_LEN);
 		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
