@@ -196,7 +196,7 @@ void print_bio(char *msg, struct bio *bio)
 		kernel_write(bio_file, str, strlen(str), &bio_file->f_pos);
 		kfree(str);
                 bio_advance_iter(bio, &iter_out, size);
-		if (++count >= 4)
+		if (++count >= 6)
 			break;
             }
 	    if (p)
@@ -1674,10 +1674,14 @@ blk_status_t crypt_convert(struct crypt_config *cc,
 	unsigned int *tag_offset = ctx->tag_offset;
 	unsigned int sector_step = cc->sector_size >> SECTOR_SHIFT;
 	int r;
+	struct dm_crypt_io *io = container_of(ctx, struct dm_crypt_io, ctx);
+	int start_sector = ctx->cc_sector;
+	int sector_idx = 0;
+	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
-		printk("crypt_convert %s sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
-				(bio_data_dir(ctx->bio_in) == WRITE) ? "WRITE" : "READ", ctx->cc_sector, *tag_offset, 
-				ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+	printk("crypt_convert %s sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
+		(bio_data_dir(ctx->bio_in) == WRITE) ? "WRITE" : "READ", ctx->cc_sector, *tag_offset, 
+		ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
 	/*
 	 * if reset_pending is set we are dealing with the bio for the first time,
 	 * else we're continuing to work on the previous bio, so don't mess with
@@ -1689,6 +1693,17 @@ blk_status_t crypt_convert(struct crypt_config *cc,
 	while (ctx->iter_in.bi_size && ctx->iter_out.bi_size) {
 		//printk("sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
 		//		ctx->cc_sector, *tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
+		// This is a kludge to make reads/writes of hidden data expanding to multiple sectors
+		// Since each logical sector is mapped to a different physical sector, we need to keep 
+		// track of how many 16 byte sectors we encrypted/decrypted. Once that reaches num_sectors
+		// we get the next sector number to use from io->freelist
+		// io->freelist[0] holds the mapped physical sector for the first of the logical sectors
+		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags & PD_HIDDEN_OPERATION)) {
+			if (ctx->cc_sector - start_sector == num_sectors) {
+				//printk("crypt_convert, current sector start %d, next sector start %d", start_sector, io->freelist[sector_idx+1][0].start);
+				start_sector = ctx->cc_sector = io->freelist[++sector_idx][0].start;
+			}
+		}
 
 		r = crypt_alloc_req(cc, ctx);
 		if (r) {
@@ -1997,8 +2012,6 @@ static void crypt_endio(struct bio *clone)
 				// save the base bio for future and work on clone and other pages
 				io->write_bio = io->base_bio;
 				io->base_bio = clone;
-				io->write_sector = io->sector;
-				io->sector = io->read_sector;
 				io->write_ctx_bio = io->ctx.bio_out;
 			}
 			else { // Only READ
@@ -2011,8 +2024,7 @@ static void crypt_endio(struct bio *clone)
         	                size = num_sectors * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
 		                struct bio *bio = crypt_alloc_buffer(io, size, 0);
 
-				io->write_sector = io->sector;
-				io->sector = num_sectors * io->sector;
+				io->sector = io->freelist[0][0].start;
 
 		                if (unlikely(!bio)) {
 		                        io->error = BLK_STS_IOERR;
@@ -2077,7 +2089,7 @@ static void crypt_endio(struct bio *clone)
                                 offset += cc->on_disk_tag_size;
                         }
 
-                        print_bio("Inside crypt_endio, pub write, hidden data before decryption", bio);
+                        //print_bio("Inside crypt_endio, pub write, hidden data before decryption", bio);
 
                         //print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
                         //print_bio("Inside crypt_endio", io->base_bio);
@@ -2196,12 +2208,13 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			int j = 0;
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
-				
+				/*	
 				// TEST //
 				int k = 0;
 				for (k = 0; k < num_sectors; k++)
 					addto_freelist(k+2);
 				// TEST //
+				// */
 				
 				if(getfrom_freelist(num_sectors, io->freelist[i])) {
 					printk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
@@ -2209,7 +2222,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 					io->error = BLK_STS_IOERR;	
 					return 1;
 				}
-				print_freelist();
+				//print_freelist();
 			}
 			// read list of sectors from map
 			else {
@@ -2622,7 +2635,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                 }
 		clone->bi_opf = REQ_OP_WRITE;
 
-		print_bio("kcryptd_crypt_write_convert hidden data base bio", io->base_bio);
+		//print_bio("kcryptd_crypt_write_convert hidden data base bio", io->base_bio);
 
 	        struct bvec_iter iter_in = io->base_bio->bi_iter;
 	        struct bvec_iter iter_out = clone->bi_iter;
@@ -2672,10 +2685,16 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                 }
 
                 crypt_convert_init(cc, ctx, clone, clone, num_sectors * sector, &tag_offset);
-
-                io->flags |= PD_HIDDEN_OPERATION;
+		// we don't do the encryption now as we dont have the mapping physical sectors
+		// yet. Instead we do the encryption in read_convert
 
 		print_bio("write_convert after randombytes and magic", clone);
+
+                printk("PD initiating READ during WRITE\n");
+                io->flags |= PD_READ_DURING_HIDDEN_WRITE;
+
+                kcryptd_queue_read(io);
+                return;
 	}
 	else if (!(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                 printk("PD initiating READ during PUBLIC WRITE\n");
@@ -2723,23 +2742,6 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
 	//if (!(io->flags & PD_READ_DURING_HIDDEN_WRITE))
 	//	print_bio("kcryptd_crypt_write_convert", io->ctx.bio_out);
-	
-	/*
-	 * 1. read equivalent sectors for integrity metadata. This should result in decrypted data with integ m/d
-	 * 2. copy the above encrypted input to integ m/d from #1
-	 * 3. write all the sectors with integ md after encryption
-	 */
-	
-	if ( crypt_finished && test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && !(io->flags & PD_READ_DURING_HIDDEN_WRITE)) {
-		print_bio("kcryptd_crypt_write_convert encrypted hidden data", io->ctx.bio_out);
-		printk("PD initiating READ during WRITE\n");
-		io->flags &= ~PD_HIDDEN_OPERATION;
-		io->flags |= PD_READ_DURING_HIDDEN_WRITE;
-
-		kcryptd_queue_read(io);
-		crypt_dec_pending(io);
-		return;
-	}
 	
         if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags & PD_READ_DURING_HIDDEN_WRITE)) {
                                 io->base_bio = io->write_bio;
@@ -2902,8 +2904,8 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		unsigned sector = io->write_bio->bi_iter.bi_sector;
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
-		print_freelist();
-		print_bio("kcryptd_crypt_read_convert, pub write, after decrypting hidden data", io->ctx.bio_out);
+		//print_freelist();
+		//print_bio("kcryptd_crypt_read_convert, pub write, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
@@ -2973,10 +2975,20 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	//print_bio("Inside kcryptd_crypt_read_convert,", io->base_bio);
 
         if ((io->flags & PD_READ_DURING_HIDDEN_WRITE)) {
-	    // copy data from io->write_ctx_bio to integrity_metadata
+	   // encrypt and copy data from io->write_ctx_bio to integrity_metadata
+	   // we do the encryption of hidden data here as we have the mappings now.
+            tag_offset = 0;
+            sector = io->freelist[0][0].start;
+	    io->flags |= PD_HIDDEN_OPERATION;
+            crypt_convert_init(cc, &io->ctx, io->write_ctx_bio, io->write_ctx_bio, sector, &tag_offset);
+            r = crypt_convert(cc, &io->ctx,
+                              test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+
+	    io->flags &= ~PD_HIDDEN_OPERATION;
             struct bvec_iter iter_out = io->write_ctx_bio->bi_iter;
             unsigned offset = 0;
-            printk("Inside kcryptd_crypt_read_convert, writing %d bytes to integrity metadata\n", iter_out.bi_size);
+	    print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
+            //printk("Inside kcryptd_crypt_read_convert, writing %d bytes to integrity metadata\n", iter_out.bi_size);
             while (iter_out.bi_size) {
                 struct bio_vec bv_out = bio_iter_iovec(io->write_ctx_bio, iter_out);
                 char *buffer = page_to_virt(bv_out.bv_page);
@@ -2987,14 +2999,13 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->on_disk_tag_size;
 		//printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
-	    //print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
 
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
 	    bio_put(io->write_ctx_bio);
 
 	    // write the whole thing
-	    printk("kcryptd_crypt_read_convert, encrypting and writing %d bytes\n", io->base_bio->bi_iter.bi_size);
+	    //printk("kcryptd_crypt_read_convert, encrypting and writing %d bytes\n", io->base_bio->bi_iter.bi_size);
 	    io->base_bio->bi_opf = REQ_OP_WRITE;
 
 	    kcryptd_crypt_write_convert(io);
