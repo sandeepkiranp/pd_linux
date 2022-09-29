@@ -120,7 +120,7 @@ static bool crypt_integrity_aead(struct crypt_config *cc);
 
 struct file *bio_file = NULL;
 
-//#define printk(f_, ...) 
+#define printk(f_, ...) 
 
 void print_integrity_metadata(char *msg, char *data)
 {
@@ -222,7 +222,6 @@ void addto_freelist(unsigned sector)
 	node->next = NULL;
 
 	//LOCK
-	spin_lock(&freelist_lock);
 	if (head_freelist == NULL) {
 		printk("addto_freelist head=tail=NULL");
 		head_freelist = tail_freelist = node;
@@ -241,7 +240,6 @@ void addto_freelist(unsigned sector)
 		if(sector == temp->sector) {
 			printk("addto_freelist sector %d already exists in freelist, total elements in freelist %d\n", sector, total_freelist);
 			kfree(node);
-			spin_unlock(&freelist_lock);
 			return;
 		}
 		prev = temp;
@@ -253,7 +251,6 @@ unlock:
 	total_freelist++;
 	printk("addto_freelist, added %d, total elements in freelist %d\n", sector, total_freelist);
 	printk("============================");
-	spin_unlock(&freelist_lock);
 	//UNLOCK
 	return;
 }
@@ -273,9 +270,9 @@ void print_freelist(void )
 int getfrom_freelist(int sector_count, struct freelist_results *results)
 {
         //LOCK
-	spin_lock(&freelist_lock);
-        if (!head_freelist || !total_freelist)
+        if (!head_freelist || !total_freelist) {
                 return -1;
+	}
        	printk("getfrom_freelist, requested %d sectors from total of %d, head is %p\n", sector_count, total_freelist, head_freelist);
         struct freelist *temp = head_freelist;
         struct freelist *next = temp->next;
@@ -302,7 +299,6 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
        	printk("getfrom_freelist, while completed, requested %d sectors, got %d, from total of %d\n", sector_count, count, total_freelist);
         if(count != sector_count) {
                 printk("getfrom_freelist, found only %d free contiguous sectors out of required %d sectors. total sectors %d\n", count, sector_count, total_freelist);
-		spin_unlock(&freelist_lock);
                 return -1; 
         }   
         else {
@@ -310,12 +306,7 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
 				sector_count, total_freelist, temp->sector, temp, temp_prev, temp->next, head_freelist);
                 results[0].start = temp->sector;
                 results[0].len = count;
-	/*	
-	// TEST
-	spin_unlock(&freelist_lock);
-	return 0;
-	// TEST
-	*/
+
                 // remove alloted nodes from freelist
                 prev = temp;
                 temp = temp->next;
@@ -330,7 +321,6 @@ int getfrom_freelist(int sector_count, struct freelist_results *results)
                 else
                         head_freelist = next; //move the head pointer
                 total_freelist -= sector_count;
-		spin_unlock(&freelist_lock);
         	printk("getfrom_freelist, returning %p", head_freelist);
 		printk("=========================");
                 return 0;
@@ -2229,13 +2219,11 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 			int j = 0;
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
-				/*	
 				// TEST //
-				
 				int k = 0;
+				spin_lock(&freelist_lock);
 				for (k = 0; k < num_sectors; k++) {
-					addto_freelist((i + io->base_bio->bi_iter.bi_sector)*num_sectors + k + 2);
-				//	addto_freelist((i+1)*num_sectors+k+2);
+					addto_freelist((i + io->base_bio->bi_iter.bi_sector)*num_sectors + k);
 				}
 				// TEST //
 			        printk("kcryptd_io_read total freelist %d\n", total_freelist);	
@@ -2243,13 +2231,13 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 					printk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
 					crypt_dec_pending(io);
 					io->error = BLK_STS_IOERR;	
+					spin_unlock(&freelist_lock);
 					return 1;
 				}
-			
-				*/
+				spin_unlock(&freelist_lock);
 				
-				io->freelist[i][0].start = (i + io->base_bio->bi_iter.bi_sector)*num_sectors;
-				io->freelist[i][0].len = 57;
+				//io->freelist[i][0].start = (i + io->base_bio->bi_iter.bi_sector)*num_sectors;
+				//io->freelist[i][0].len = 57;
 				
 				//print_freelist();
 			}
@@ -2951,7 +2939,9 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG], sector);
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
+				spin_lock(&freelist_lock);
 				addto_freelist(sector);
+				spin_unlock(&freelist_lock);
 			}
 			bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
 			sector++;
