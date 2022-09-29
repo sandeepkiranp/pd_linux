@@ -1862,7 +1862,7 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 	dio->bi_status = 0;
 	dio->op = bio_op(bio);
 
-	//printk("Inside dm_integrity_map incoming bio sector %d, size %d\n", bio->bi_iter.bi_sector, bio->bi_iter.bi_size);
+	//printk("Inside dm_integrity_map incoming bio sector %d, size %d bip %p\n", bio->bi_iter.bi_sector, bio->bi_iter.bi_size, bio_integrity(bio));
 
 	if (unlikely(dio->op == REQ_OP_DISCARD)) {
 		if (ti->max_io_len) {
@@ -1929,6 +1929,20 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 				      bip->bip_iter.bi_size, wanted_tag_size);
 				return DM_MAPIO_KILL;
 			}
+			/*
+			if (likely(dio->op == REQ_OP_WRITE)) {
+                        	struct bio_vec biv;
+                        	struct bvec_iter iter;
+                        	bip_for_each_vec(biv, bip, iter) {
+                               		unsigned char *tag;
+
+                               		BUG_ON(PageHighMem(biv.bv_page));
+                                	tag = bvec_virt(&biv);
+		                        printk("Integrity metadata is %02hhx %02hhx %02hhx %02hhx %02hhx %02hhx %02hhx %02hhx %02hhx %02hhx",
+							tag[0], tag[1], tag[2],tag[3],tag[4],tag[5],tag[6],tag[7],tag[8],tag[9]);
+                        	}
+			}
+			*/
 		}
 	} else {
 		if (unlikely(bip != NULL)) {
