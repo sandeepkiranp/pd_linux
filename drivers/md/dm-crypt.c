@@ -2743,6 +2743,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
 		io->ctx.bio_out = clone;
 		io->ctx.iter_out = clone->bi_iter;
+		io->ctx.bio_out->bi_iter.bi_sector = io->sector;
 	}
 
 	sector += bio_sectors(clone);
@@ -2782,7 +2783,8 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
                                 return;
         }
         if (crypt_finished && (io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
-                                //printk("restored base bio. before submitting out size %d, base io size %d\n", io->ctx.iter_out.bi_size, io->base_bio->bi_iter.bi_size);
+                                printk("kcryptd_crypt_write_convert,before submitting out sector %d, out size %d, base bio sector %d, base io size %d\n", 
+						io->ctx.bio_out->bi_iter.bi_sector, io->ctx.bio_out->bi_iter.bi_size, io->base_bio->bi_iter.bi_sector, io->base_bio->bi_iter.bi_size);
                                 kcryptd_crypt_write_io_submit(io, 0);
                                 crypt_dec_pending(io);
                                 return;
