@@ -55,6 +55,8 @@
  * On disk structures
  */
 
+struct dm_integrity_c *global_ic = NULL;
+
 #define SB_MAGIC			"integrt"
 #define SB_VERSION_1			1
 #define SB_VERSION_2			2
@@ -384,7 +386,8 @@ static const struct blk_integrity_profile dm_integrity_profile = {
 static void dm_integrity_map_continue(struct dm_integrity_io *dio, bool from_map);
 static void integrity_bio_wait(struct work_struct *w);
 static void dm_integrity_dtr(struct dm_target *ti);
-
+static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, sector_t *metadata_block,
+                               unsigned *metadata_offset, unsigned total_size, int op);
 static void dm_integrity_io_error(struct dm_integrity_c *ic, const char *msg, int err)
 {
 	if (err == -EILSEQ)
@@ -426,6 +429,7 @@ static void get_area_and_offset(struct dm_integrity_c *ic, sector_t data_sector,
 		__u8 log2_interleave_sectors = ic->sb->log2_interleave_sectors;
 		*area = data_sector >> log2_interleave_sectors;
 		*offset = (unsigned)data_sector & ((1U << log2_interleave_sectors) - 1);
+		//printk("sector %d, Area %d, Offset %d\n", data_sector, *area, *offset);
 	} else {
 		*area = 0;
 		*offset = data_sector;
@@ -461,6 +465,7 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 		mo = (offset * ic->tag_size) & ((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - 1);
 	}
 	*metadata_offset = mo;
+	//printk("Area %d, Offset %d, ms %d, mo %d, metadata_run %d, buffer_sectors %d", area, offset, ms, mo, ic->log2_metadata_run, ic->log2_buffer_sectors);
 	return ms;
 }
 
@@ -479,6 +484,8 @@ static sector_t get_data_sector(struct dm_integrity_c *ic, sector_t area, sector
 
 	result += (sector_t)ic->initial_sectors + offset;
 	result += ic->start;
+
+	//printk("Actual data sector area %d, offset %d, sector %d, initial_sectors %d, start %d", area, offset, result, (sector_t)ic->initial_sectors, ic->start);
 
 	return result;
 }
@@ -591,6 +598,50 @@ static int sync_rw_sb(struct dm_integrity_c *ic, int op, int op_flags)
 	return 0;
 }
 
+
+void get_map_data(void)
+{
+        struct dm_integrity_c *ic = global_ic;
+        struct dm_io_request io_req;
+        struct dm_io_region io_loc;
+        int r;
+        char tag[16] = {0};
+	sector_t area, offset, metadata_block;
+	unsigned metadata_offset;
+
+	if (!global_ic) {
+		printk("global_ic is NULL\n");
+		return;
+	}
+
+	char *buffer = kmalloc(1024, GFP_KERNEL);
+	printk("get_map_data, entering\n");
+        io_req.bi_op = REQ_OP_READ;
+        io_req.bi_op_flags = 0;
+        io_req.mem.type = DM_IO_KMEM;
+        io_req.mem.ptr.addr = buffer;
+        io_req.notify.fn = NULL;
+        io_req.client = ic->io;
+        io_loc.bdev = ic->meta_dev ? ic->meta_dev->bdev : ic->dev->bdev;
+        io_loc.sector = 30000;
+        io_loc.count = 1;
+
+        r = dm_io(&io_req, 1, &io_loc, NULL);
+        if (unlikely(r))
+                return ;
+
+	kfree(buffer);
+	get_area_and_offset(ic, 30000, &area, &offset);
+	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
+        r = dm_integrity_rw_tag(ic, tag, &metadata_block, &metadata_offset, 16, 0);
+        if (unlikely(r)) {
+		printk("dm_integrity_rw_tag error");
+        }
+
+	printk("get_map_data, leaving\n");
+}
+
+EXPORT_SYMBOL(get_map_data);
 #define BITMAP_OP_TEST_ALL_SET		0
 #define BITMAP_OP_TEST_ALL_CLEAR	1
 #define BITMAP_OP_SET			2
@@ -1703,6 +1754,8 @@ static void integrity_metadata(struct work_struct *w)
 	struct dm_integrity_c *ic = dio->ic;
 
 	int r;
+
+	//printk("Inside integrity_metadata\n");
 
 	if (ic->internal_hash) {
 		struct bvec_iter iter;
@@ -3490,6 +3543,7 @@ static int initialize_superblock(struct dm_integrity_c *ic, unsigned journal_sec
 		get_random_bytes(ic->sb->salt, SALT_SIZE);
 	}
 
+	//printk("meta_dev %p", ic->meta_dev);
 	if (!ic->meta_dev) {
 		if (ic->fix_padding)
 			ic->sb->flags |= cpu_to_le32(SB_FLAG_FIXED_PADDING);
@@ -3499,6 +3553,8 @@ static int initialize_superblock(struct dm_integrity_c *ic, unsigned journal_sec
 		ic->sb->log2_interleave_sectors = __fls(interleave_sectors);
 		ic->sb->log2_interleave_sectors = max((__u8)MIN_LOG2_INTERLEAVE_SECTORS, ic->sb->log2_interleave_sectors);
 		ic->sb->log2_interleave_sectors = min((__u8)MAX_LOG2_INTERLEAVE_SECTORS, ic->sb->log2_interleave_sectors);
+
+		//printk("log2_interleave_sectors %d, interleave_sectors %d", ic->sb->log2_interleave_sectors, interleave_sectors);
 
 		get_provided_data_sectors(ic);
 		if (!ic->provided_data_sectors)
@@ -4008,6 +4064,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		return -ENOMEM;
 	}
 	ti->private = ic;
+	global_ic = ic;
 	ti->per_io_data_size = sizeof(struct dm_integrity_io);
 	ic->ti = ti;
 

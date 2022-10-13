@@ -114,11 +114,12 @@ static void kcryptd_queue_crypt(struct dm_crypt_io *io);
 static struct scatterlist *crypt_get_sg_data(struct crypt_config *cc,
 					     struct scatterlist *sg);
 static void kcryptd_crypt_write_io_submit(struct dm_crypt_io *io, int async);
-static void kcryptd_io_rdwr_map(struct work_struct *work);
+static void kcryptd_io_rdwr_map(struct dm_crypt_io *io);
 
 static bool crypt_integrity_aead(struct crypt_config *cc);
 
 struct file *bio_file = NULL;
+extern void get_map_data(void);
 
 #define printk(f_, ...) 
 
@@ -2007,8 +2008,7 @@ static void crypt_endio(struct bio *clone)
 			io_free_pages(io);
 			bio_put(clone);
 			//update the map
-                	INIT_WORK(&io->work, kcryptd_io_rdwr_map);
-                	queue_work(cc->map_queue, &io->work);
+                	kcryptd_io_rdwr_map(io);
 			return;
 		}
 	}
@@ -2332,9 +2332,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 	return 0;
 }
 
-static void kcryptd_io_rdwr_map(struct work_struct *work)
+static void kcryptd_io_rdwr_map(struct dm_crypt_io *io)
 {
-	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
         int i, j;
         unsigned sector = io->base_bio->bi_iter.bi_sector;
 
@@ -3597,8 +3596,6 @@ static void crypt_dtr(struct dm_target *ti)
 		destroy_workqueue(cc->io_queue);
 	if (cc->crypt_queue)
 		destroy_workqueue(cc->crypt_queue);
-	if (cc->map_queue)
-		destroy_workqueue(cc->map_queue);
 
 	file_close(bio_file);
 
@@ -4273,13 +4270,6 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-        cc->map_queue = alloc_workqueue("kcryptd_map/%s", WQ_MEM_RECLAIM, 1, devname);
-        if (!cc->map_queue) {
-                ti->error = "Couldn't create kcryptd map queue";
-                goto bad;
-        }
-
-
 	spin_lock_init(&cc->write_thread_lock);
 	cc->write_tree = RB_ROOT;
 
@@ -4292,6 +4282,9 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
+
+	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
+		get_map_data();
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
