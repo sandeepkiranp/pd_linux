@@ -599,13 +599,12 @@ static int sync_rw_sb(struct dm_integrity_c *ic, int op, int op_flags)
 }
 
 
-void get_map_data(void)
+void get_map_data(sector_t sector, char *tag, int tag_size)
 {
         struct dm_integrity_c *ic = global_ic;
         struct dm_io_request io_req;
         struct dm_io_region io_loc;
         int r;
-        char tag[16] = {0};
 	sector_t area, offset, metadata_block;
 	unsigned metadata_offset;
 
@@ -613,7 +612,7 @@ void get_map_data(void)
 		printk("global_ic is NULL\n");
 		return;
 	}
-
+/*
 	char *buffer = kmalloc(1024, GFP_KERNEL);
 	printk("get_map_data, entering\n");
         io_req.bi_op = REQ_OP_READ;
@@ -631,14 +630,15 @@ void get_map_data(void)
                 return ;
 
 	kfree(buffer);
-	get_area_and_offset(ic, 30000, &area, &offset);
+*/
+	get_area_and_offset(ic, sector, &area, &offset);
 	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
-        r = dm_integrity_rw_tag(ic, tag, &metadata_block, &metadata_offset, 16, 0);
+        r = dm_integrity_rw_tag(ic, tag, &metadata_block, &metadata_offset, tag_size, 0); //0 is for READ
         if (unlikely(r)) {
 		printk("dm_integrity_rw_tag error");
         }
 
-	printk("get_map_data, leaving\n");
+	printk("get_map_data, sector %d area %d, offset %d, ms %d, mo %d\n", sector, area, offset, metadata_block, metadata_offset);
 }
 
 EXPORT_SYMBOL(get_map_data);
