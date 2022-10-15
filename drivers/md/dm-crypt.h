@@ -1,6 +1,7 @@
 #define PD_READ_DURING_HIDDEN_WRITE        0x01
 #define PD_HIDDEN_OPERATION         0x02
 #define PD_READ_DURING_PUBLIC_WRITE 0x04
+#define PD_READ_MAP_DATA 0x08
 #define PD_MAP_MAGIC_DATA  0xBB
 /*
  * context holding the current state of a multi-part conversion

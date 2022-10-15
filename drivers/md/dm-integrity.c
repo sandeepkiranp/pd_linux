@@ -616,25 +616,7 @@ void get_map_data(sector_t sector, char *tag, int tag_size, unsigned *max_sector
 		*max_sectors = ic->provided_data_sectors;
 		return;
 	}
-/*
-	char *buffer = kmalloc(1024, GFP_KERNEL);
-	printk("get_map_data, entering\n");
-        io_req.bi_op = REQ_OP_READ;
-        io_req.bi_op_flags = 0;
-        io_req.mem.type = DM_IO_KMEM;
-        io_req.mem.ptr.addr = buffer;
-        io_req.notify.fn = NULL;
-        io_req.client = ic->io;
-        io_loc.bdev = ic->meta_dev ? ic->meta_dev->bdev : ic->dev->bdev;
-        io_loc.sector = 30000;
-        io_loc.count = 1;
 
-        r = dm_io(&io_req, 1, &io_loc, NULL);
-        if (unlikely(r))
-                return ;
-
-	kfree(buffer);
-*/
 	get_area_and_offset(ic, sector, &area, &offset);
 	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
         r = dm_integrity_rw_tag(ic, tag, &metadata_block, &metadata_offset, tag_size, 0); //0 is for READ
@@ -642,7 +624,7 @@ void get_map_data(sector_t sector, char *tag, int tag_size, unsigned *max_sector
 		printk("dm_integrity_rw_tag error");
         }
 
-	printk("get_map_data, sector %d area %d, offset %d, ms %d, mo %d\n", sector, area, offset, metadata_block, metadata_offset);
+	//printk("get_map_data, sector %d area %d, offset %d, ms %d, mo %d\n", sector, area, offset, metadata_block, metadata_offset);
 }
 
 EXPORT_SYMBOL(get_map_data);
