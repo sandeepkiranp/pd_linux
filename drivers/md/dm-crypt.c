@@ -4133,8 +4133,8 @@ void process_map_data(struct crypt_config *cc)
 		tag_size = num_sectors * cc->on_disk_tag_size;
 		memset(tag, 0, tag_size);
 		get_map_data(current_sector, tag, tag_size, NULL);
-		//sprintk("process_map_data sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
-		//		current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
+		printk("process_map_data sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
+				current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
 
 		if (crypt_integrity_aead(cc))
 			io->ctx.r.req_aead = (struct aead_request *)(io + 1);
@@ -4158,8 +4158,42 @@ void process_map_data(struct crypt_config *cc)
 			printk("crypt_convert failed");
 			io->error = r; //TODO: free everything and return failure
 		}
+#if 0
+                iter_out = bio->bi_iter;
+                offset = 0;
+		unsigned pub_sector = current_sector;
+                while (iter_out.bi_size) {
+                        struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+                        char *buffer = page_to_virt(bv_out.bv_page);
+			unsigned sector_num;
+			int sequence_num;
+
+				/*
+			if (buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+                        	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                        	memcpy(&sequence_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+
+	                        unsigned int current_sequence_num;
+        	                if (map_find(sector_num, &current_sequence_num) != -1) {
+                	                if(sequence_num > current_sequence_num) {
+						map_insert(sector_num, pub_sector);
+					}
+				}
+				else {
+					map_insert(sector_num, pub_sector);
+				}
+			}
+				*/
+
+                        bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
+                        offset += cc->on_disk_tag_size;
+			pub_sector++;
+                }
+#endif
+
 		current_sector += num_sectors;
 		tag_offset = 0;
+		break;
 	}
 
 	//print_bio("Data during initialization", bio);
@@ -4393,8 +4427,8 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
 
-	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
-		process_map_data(cc);
+	//if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
+	//	process_map_data(cc);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
