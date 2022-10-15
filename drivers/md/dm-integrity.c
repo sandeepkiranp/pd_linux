@@ -599,7 +599,7 @@ static int sync_rw_sb(struct dm_integrity_c *ic, int op, int op_flags)
 }
 
 
-void get_map_data(sector_t sector, char *tag, int tag_size)
+void get_map_data(sector_t sector, char *tag, int tag_size, unsigned *max_sectors)
 {
         struct dm_integrity_c *ic = global_ic;
         struct dm_io_request io_req;
@@ -610,6 +610,10 @@ void get_map_data(sector_t sector, char *tag, int tag_size)
 
 	if (!global_ic) {
 		printk("global_ic is NULL\n");
+		return;
+	}
+	if (max_sectors) {
+		*max_sectors = ic->provided_data_sectors;
 		return;
 	}
 /*
