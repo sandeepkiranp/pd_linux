@@ -2153,10 +2153,10 @@ static void io_add_bio_vec(struct dm_crypt_io *io, struct bio_vec *bv)
 	io->pages_tail = temp;
 }
 
-int map_insert(unsigned sector, unsigned value)
+int map_insert(unsigned sector, unsigned value, unsigned char *lseq_num)
 {
 	int r;
-	unsigned seq_num = 0;
+	unsigned char seq_num = 0;
 	idr_preload(GFP_KERNEL);
 	unsigned long complete = 0;
 
@@ -2167,7 +2167,10 @@ int map_insert(unsigned sector, unsigned value)
 		seq_num = complete >> 32;
 		idr_remove(&map_idr, sector);
 	}
-	seq_num++;
+	if (lseq_num)
+		seq_num = *lseq_num;
+	else
+		seq_num++;
 	complete = seq_num;
 	complete = complete << 32 | value;
 	r = idr_alloc(&map_idr, (void *)complete, sector, sector + 1, GFP_NOWAIT);
@@ -2180,10 +2183,10 @@ int map_insert(unsigned sector, unsigned value)
 	return 0;
 }
 
-int map_find(unsigned sector, int *seq_num)
+int map_find(unsigned sector, unsigned char *seq_num)
 {
 	int value = 0;
-	int lseq_num = 0;
+	unsigned char lseq_num = 0;
 	spin_lock(&map_lock);
 	unsigned long complete = (unsigned long)idr_find(&map_idr, sector);
 	spin_unlock(&map_lock);
@@ -2350,7 +2353,7 @@ static void kcryptd_io_rdwr_map(struct dm_crypt_io *io)
 	if (!io->freelist)
 		goto ret;
 	for(i = 0; i < bio_sectors(io->base_bio); i++) {
-		if (map_insert(sector, io->freelist[i][0].start))
+		if (map_insert(sector, io->freelist[i][0].start, NULL))
 			sprintk("kcryptd_io_rdwr_map, error inserting key %d, value %d into map", sector, io->freelist[i][0].start);
 		sector++;
 	}
@@ -2673,7 +2676,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			struct bio_vec bv_out = bio_iter_iovec(clone, iter_out);
 			char *sbuffer = kmap_atomic(bv_in.bv_page);
 			char *dbuffer = page_to_virt(bv_out.bv_page);
-			unsigned int sequence_number;
+			unsigned char sequence_number;
 			if (map_find(sector_num, &sequence_number) == -1)
 				sequence_number = 1;
 			else
@@ -2699,7 +2702,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			/* Hiddenbytes | Sector Num | Sequence Number | RandomBytes | Magic */
 			sprintk("kcryptd_crypt_write_convert, logical sector number %d, sector sequence number %d\n", sector_num, sequence_number);
 			memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);
-			memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sequence_number, SEQUENCE_NUMBER_LEN);
+			dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN] = sequence_number;
 			get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
 			dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 
@@ -4173,18 +4176,18 @@ void process_map_data(struct crypt_config *cc)
                         	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
 				sequence_num =  (unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
 
-	                        unsigned int current_sequence_num;
+	                        unsigned char current_sequence_num;
         	                if (map_find(sector_num, &current_sequence_num) != -1) {
-					if (sector_num < 0) {
-				        printk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
-							sector_num, pub_sector, sequence_num, current_sequence_num); 
-					}
                 	                if(sequence_num > current_sequence_num) {
-						map_insert(sector_num, pub_sector);
+				        	//printk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
+						//	sector_num, pub_sector, sequence_num, current_sequence_num); 
+						map_insert(sector_num, pub_sector, &sequence_num);
 					}
 				}
 				else {
-					map_insert(sector_num, pub_sector);
+				        	//printk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
+						//	sector_num, pub_sector, sequence_num, current_sequence_num); 
+					map_insert(sector_num, pub_sector, &sequence_num);
 				}
 			}
 
