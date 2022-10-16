@@ -2938,25 +2938,52 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		unsigned sector = io->write_bio->bi_iter.bi_sector;
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
+		unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 		//print_freelist();
 		//print_bio("kcryptd_crypt_read_convert, pub write, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
+			bool found = false;
+
 			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
-				sprintk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV for sector %d\n", sector);
-				//refresh the randomness	
-				get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
+                        	unsigned sector_num = 0;
+                        	unsigned char sequence_num = 0;
+				unsigned char current_sequence_num;
+
+                        	memcpy(&sector_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                        	sequence_num =  (unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
+				//get the mapped physical sector number for this logical sector
+				if (map_find(sector_num, &current_sequence_num) != -1) {
+					if (sequence_num != current_sequence_num)
+						found = false;
+					else if(sector_num <= sector && sector < sector_num + num_sectors)
+						found = true;
+				}
+				else {
+					//for some reason the map doesnt contain this logical sector.
+					found = false;
+				}
 			}
 			else {
-				sprintk("No hidden data present (magic %02hhx), generating random IV for sector %d\n", 
-						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG], sector);
-				//fill random bytes in IV
-				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
-				spin_lock(&freelist_lock);
-				addto_freelist(sector);
-				spin_unlock(&freelist_lock);
+				found = false;
 			}
+
+			if (found) {
+                                //refresh the randomness        
+                                printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV for sector %d\n", sector);
+                                get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
+			}
+			else {
+				printk("No hidden data present (magic %02hhx), generating random IV for sector %d\n", 
+						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG], sector);
+                                //fill random bytes in IV
+                                get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
+                                spin_lock(&freelist_lock);
+                                addto_freelist(sector);
+                                spin_unlock(&freelist_lock);
+			}
+
 			bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
 			sector++;
 		}
