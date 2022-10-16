@@ -102,7 +102,7 @@ enum cipher_flags {
 #define SEQUENCE_NUMBER_LEN	1
 #define RANDOM_BYTES_PER_TAG 1
 #define PD_MAGIC_DATA		0xAA
-#define CHUNK_NUM_SECTORS 1
+#define CHUNK_NUM_SECTORS 32768 
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
 static unsigned dm_crypt_clients_n = 0;
@@ -4198,8 +4198,7 @@ void process_map_data(struct crypt_config *cc)
 			unsigned sector_num = 0;
 			unsigned char sequence_num = 0;
 
-			//if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
-			{
+			if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
                         	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
 				sequence_num =  (unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
 
@@ -4223,7 +4222,7 @@ void process_map_data(struct crypt_config *cc)
 			pub_sector++;
                 }
 
-		current_sector += 57;
+		current_sector += num_sectors;
 		tag_offset = 0;
 	}
 
