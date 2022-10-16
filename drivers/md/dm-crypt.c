@@ -102,7 +102,7 @@ enum cipher_flags {
 #define SEQUENCE_NUMBER_LEN	1
 #define RANDOM_BYTES_PER_TAG 1
 #define PD_MAGIC_DATA		0xAA
-#define CHUNK_NUM_SECTORS 32768
+#define CHUNK_NUM_SECTORS 1
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
 static unsigned dm_crypt_clients_n = 0;
@@ -4121,7 +4121,7 @@ void process_map_data(struct crypt_config *cc)
 	unsigned num_sectors;
 
 	get_map_data(0, 0, 0, &max_sectors); 
-	sprintk("process_map_data, max_sectors %d\n", max_sectors);
+	printk("process_map_data, max_sectors %d\n", max_sectors);
 
 	io = (struct dm_crypt_io *)kmalloc(cc->per_bio_data_size, GFP_KERNEL);
 
@@ -4188,18 +4188,18 @@ void process_map_data(struct crypt_config *cc)
 			sprintk("crypt_convert failed");
 			io->error = r; //TODO: free everything and return failure
 		}
-
                 iter_out = bio->bi_iter;
                 offset = 0;
 		unsigned pub_sector = current_sector;
-		print_bio("Data during initialization", bio);
+		//print_bio("Data during initialization", bio);
                 while (iter_out.bi_size) {
                         struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                         char *buffer = page_to_virt(bv_out.bv_page);
 			unsigned sector_num = 0;
 			unsigned char sequence_num = 0;
 
-			if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			//if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			{
                         	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
 				sequence_num =  (unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
 
@@ -4223,15 +4223,14 @@ void process_map_data(struct crypt_config *cc)
 			pub_sector++;
                 }
 
-		current_sector += num_sectors;
+		current_sector += 57;
 		tag_offset = 0;
 	}
-
 
 	crypt_free_buffer_pages(cc, bio);
 	bio_put(bio);
 	kfree(io);
-	sprintk("process_map_data decrypted integrity metadata\n");
+	printk("process_map_data decrypted integrity metadata\n");
 }
 
 /*
