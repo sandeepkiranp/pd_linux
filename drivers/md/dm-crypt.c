@@ -2179,7 +2179,7 @@ int map_insert(unsigned sector, unsigned value, unsigned char *lseq_num)
 	idr_preload_end();
 	if (r < 0)
 		return r == -ENOSPC ? -EBUSY : r;
-	//printk("map_insert, Inserted key %d, value %d, seq_num %d, complete %ld", sector, value, seq_num, complete);
+	//sprintk("map_insert, Inserted key %d, value %d, seq_num %d, complete %ld", sector, value, seq_num, complete);
 	return 0;
 }
 
@@ -2971,11 +2971,11 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 			if (found) {
                                 //refresh the randomness        
-                                printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV for sector %d\n", sector);
+                                sprintk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV for sector %d\n", sector);
                                 get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
 			}
 			else {
-				printk("No hidden data present (magic %02hhx), generating random IV for sector %d\n", 
+				sprintk("No hidden data present (magic %02hhx), generating random IV for sector %d\n", 
 						buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG], sector);
                                 //fill random bytes in IV
                                 get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
@@ -4121,7 +4121,7 @@ void process_map_data(struct crypt_config *cc)
 	unsigned num_sectors;
 
 	get_map_data(0, 0, 0, &max_sectors); 
-	printk("process_map_data, max_sectors %d\n", max_sectors);
+	sprintk("process_map_data, max_sectors %d\n", max_sectors);
 
 	io = (struct dm_crypt_io *)kmalloc(cc->per_bio_data_size, GFP_KERNEL);
 
@@ -4129,7 +4129,7 @@ void process_map_data(struct crypt_config *cc)
 	tag_size = CHUNK_NUM_SECTORS * cc->on_disk_tag_size;
 	tag = kvmalloc(tag_size, GFP_KERNEL);
 	if (!tag) {
-		printk("process_map_data, Error allocating tag");
+		sprintk("process_map_data, Error allocating tag");
 		return;
 	}
 
@@ -4137,7 +4137,7 @@ void process_map_data(struct crypt_config *cc)
 	bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_READ, GFP_NOIO, &cc->bs);
 	if (unlikely(!bio)) {
 		io->error = BLK_STS_IOERR;
-		printk("process_map_data, Error allocating bio");
+		sprintk("process_map_data, Error allocating bio");
 		return;
 	}
 	remaining_size = tag_size;
@@ -4145,7 +4145,7 @@ void process_map_data(struct crypt_config *cc)
 	for (i = 0; i < nr_iovecs; i++) {
 		page = mempool_alloc(&cc->page_pool, gfp_mask);
 		if (!page) {
-			printk("Error allocating a page");
+			sprintk("Error allocating a page");
 			return;
 		}
 
@@ -4163,7 +4163,7 @@ void process_map_data(struct crypt_config *cc)
 		tag_size = num_sectors * cc->on_disk_tag_size;
 		memset(tag, 0, tag_size);
 		get_map_data(current_sector, tag, tag_size, NULL);
-		//printk("process_map_data sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
+		//sprintk("process_map_data sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
 		//		current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
 
 		if (crypt_integrity_aead(cc))
@@ -4185,7 +4185,7 @@ void process_map_data(struct crypt_config *cc)
 		r = crypt_convert(cc, &io->ctx,
 				test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
 		if (r){
-			printk("crypt_convert failed");
+			sprintk("crypt_convert failed");
 			io->error = r; //TODO: free everything and return failure
 		}
 
@@ -4206,13 +4206,13 @@ void process_map_data(struct crypt_config *cc)
 	                        unsigned char current_sequence_num;
         	                if (map_find(sector_num, &current_sequence_num) != -1) {
                 	                if(sequence_num > current_sequence_num) {
-				        	//printk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
+				        	//sprintk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
 						//	sector_num, pub_sector, sequence_num, current_sequence_num); 
 						map_insert(sector_num, pub_sector, &sequence_num);
 					}
 				}
 				else {
-				        	//printk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
+				        	//sprintk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
 						//	sector_num, pub_sector, sequence_num, current_sequence_num); 
 					map_insert(sector_num, pub_sector, &sequence_num);
 				}
@@ -4231,7 +4231,7 @@ void process_map_data(struct crypt_config *cc)
 	crypt_free_buffer_pages(cc, bio);
 	bio_put(bio);
 	kfree(io);
-	printk("process_map_data decrypted integrity metadata\n");
+	sprintk("process_map_data decrypted integrity metadata\n");
 }
 
 /*
