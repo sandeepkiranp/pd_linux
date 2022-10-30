@@ -97,12 +97,16 @@ enum cipher_flags {
 #define MAX_TAG_SIZE	480
 #define POOL_ENTRY_SIZE	512
 
-#define HIDDEN_BYTES_PER_TAG 9
+#define IV_SIZE 16
 #define SECTOR_NUM_LEN	   4
-#define SEQUENCE_NUMBER_LEN	1
-#define RANDOM_BYTES_PER_TAG 1
+#define SEQUENCE_NUMBER_LEN	2
+#define RANDOM_BYTES_PER_TAG 2
 #define PD_MAGIC_DATA		0xAA
+#define PD_MAGIC_DATA_SIZE 1 
 #define CHUNK_NUM_SECTORS 32768 
+#define HIDDEN_BYTES_IN_FIRST_IV (IV_SIZE - PD_MAGIC_DATA_SIZE - RANDOM_BYTES_PER_TAG - SEQUENCE_NUMBER_LEN - SECTOR_NUM_LEN)
+#define HIDDEN_BYTES_IN_REST_IVS (IV_SIZE - PD_MAGIC_DATA_SIZE - RANDOM_BYTES_PER_TAG) 
+#define NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR 40 // ( 1 + 512/HIDDEN_BYTES_IN_REST_IVS)
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
 static unsigned dm_crypt_clients_n = 0;
@@ -1692,7 +1696,6 @@ blk_status_t crypt_convert(struct crypt_config *cc,
 	struct dm_crypt_io *io = container_of(ctx, struct dm_crypt_io, ctx);
 	int start_sector = ctx->cc_sector;
 	int sector_idx = 0;
-	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
 	sprintk("crypt_convert %s sector %d, tag offset %d remaining in bytes %d, remaining out bytes %d, in sector %d, out sector %d", 
 			(bio_data_dir(ctx->bio_in) == WRITE) ? "WRITE" : "READ", ctx->cc_sector, *tag_offset, 
@@ -1710,7 +1713,7 @@ blk_status_t crypt_convert(struct crypt_config *cc,
 		//		ctx->cc_sector, *tag_offset, ctx->iter_in.bi_size, ctx->iter_out.bi_size, ctx->iter_in.bi_sector, ctx->iter_in.bi_sector);
 		// This is a kludge to make reads/writes of hidden data expanding to multiple sectors
 		// Since each logical sector is mapped to a different physical sector, we need to keep 
-		// track of how many 16 byte sectors we encrypted/decrypted. Once that reaches num_sectors
+		// track of how many 16 byte sectors we encrypted/decrypted. Once that reaches NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR
 		// we get the next sector number to use from io->freelist
 		// io->freelist[0] holds the mapped physical sector for the first of the logical sectors
 		//
@@ -1718,7 +1721,7 @@ blk_status_t crypt_convert(struct crypt_config *cc,
 		// The sector numbers are anyhow public and sequential
 		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (io->flags & PD_HIDDEN_OPERATION) &&
 				!(io->flags & PD_READ_MAP_DATA)) {
-			if (ctx->cc_sector - start_sector == num_sectors) {
+			if (ctx->cc_sector - start_sector == NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR) {
 				//sprintk("crypt_convert, current sector start %d, next sector start %d", start_sector, io->freelist[sector_idx+1][0].start);
 				start_sector = ctx->cc_sector = io->freelist[++sector_idx][0].start;
 			}
@@ -2038,8 +2041,7 @@ static void crypt_endio(struct bio *clone)
 				struct bvec_iter_all iter_all;
 				int count = 0;
 				unsigned size;
-				unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
-				size = num_sectors * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
+				size = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
 				struct bio *bio = crypt_alloc_buffer(io, size, 0);
 				sprintk("crypt_endio hidden read only. About to decrypt integrity metadata size %d\n", size);
 
@@ -2153,10 +2155,10 @@ static void io_add_bio_vec(struct dm_crypt_io *io, struct bio_vec *bv)
 	io->pages_tail = temp;
 }
 
-int map_insert(unsigned sector, unsigned value, unsigned char *lseq_num)
+int map_insert(unsigned sector, unsigned value, unsigned short *lseq_num)
 {
 	int r;
-	unsigned char seq_num = 0;
+	unsigned short seq_num = 0;
 	idr_preload(GFP_KERNEL);
 	unsigned long complete = 0;
 
@@ -2183,10 +2185,10 @@ int map_insert(unsigned sector, unsigned value, unsigned char *lseq_num)
 	return 0;
 }
 
-int map_find(unsigned sector, unsigned char *seq_num)
+int map_find(unsigned sector, unsigned short *seq_num)
 {
 	int value = 0;
-	unsigned char lseq_num = 0;
+	unsigned short lseq_num = 0;
 	spin_lock(&map_lock);
 	unsigned long complete = (unsigned long)idr_find(&map_idr, sector);
 	spin_unlock(&map_lock);
@@ -2212,8 +2214,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 	io->pages_head = io->pages_tail = NULL;
 	if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-		unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
-		size = num_sectors * bio_sectors(io->base_bio) * (SECTOR_SIZE << cc->sector_shift);
+		size = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * bio_sectors(io->base_bio) * (SECTOR_SIZE << cc->sector_shift);
 		unsigned rem_size = size;
 		int tag_idx = 0;
 		int i, j;
@@ -2221,8 +2222,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 		io->freelist = kmalloc(bio_sectors(io->base_bio) * sizeof(io->freelist), GFP_KERNEL);
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
-			io->freelist[i] = kmalloc(num_sectors * sizeof(struct freelist_results), GFP_KERNEL);
-			for (j = 0; j < num_sectors; j++)
+			io->freelist[i] = kmalloc(NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * sizeof(struct freelist_results), GFP_KERNEL);
+			for (j = 0; j < NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR; j++)
 				io->freelist[i][j].start = io->freelist[i][j].len = 0;
 		}
 
@@ -2233,13 +2234,13 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				// TEST //
 				int k = 0;
 				spin_lock(&freelist_lock);
-				for (k = 0; k < num_sectors; k++) {
-					addto_freelist((i + io->base_bio->bi_iter.bi_sector)*num_sectors + k);
+				for (k = 0; k < NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR; k++) {
+					addto_freelist((i + io->base_bio->bi_iter.bi_sector)*NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR + k);
 				}
 				// TEST //
 				sprintk("kcryptd_io_read total freelist %d\n", total_freelist);	
-				if(getfrom_freelist(num_sectors, io->freelist[i])) {
-					sprintk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in freelist %d\n", num_sectors, total_freelist);
+				if(getfrom_freelist(NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR, io->freelist[i])) {
+					sprintk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in freelist %d\n", NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR, total_freelist);
 					crypt_dec_pending(io);
 					io->error = BLK_STS_IOERR;	
 					spin_unlock(&freelist_lock);
@@ -2247,14 +2248,14 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 				}
 				spin_unlock(&freelist_lock);
 
-				//io->freelist[i][0].start = (i + io->base_bio->bi_iter.bi_sector)*num_sectors;
+				//io->freelist[i][0].start = (i + io->base_bio->bi_iter.bi_sector)*NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR;
 				//io->freelist[i][0].len = 57;
 
 				//print_freelist();
 			}
 			// read list of sectors from map
 			else {
-				//assuming that we have num_sectors in freelist[i][0]
+				//assuming that we have NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR in freelist[i][0]
 				if((io->freelist[i][0].start = map_find(lsector, NULL)) == -1) {
 					//sprintk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
 					//sprintk("Mapping the input sector to itself just to continue the read");
@@ -2262,10 +2263,10 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 					//go through the entire decryption process for this sector and just return some random data
 					io->freelist[i][0].start = lsector;
 				}
-				io->freelist[i][0].len = num_sectors;				
+				io->freelist[i][0].len = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR;				
 			}
 			//TODO: club adjacent sectors to increase performance
-			while(j < num_sectors && io->freelist[i][j].len) {
+			while(j < NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR && io->freelist[i][j].len) {
 				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
 				//sprintk("Iterating through freelist results [%d][%d] start %d, len %d, size %d, tag_idx %d\n", 
 				//		i, j, io->freelist[i][j].start, io->freelist[i][j].len, assigned, tag_idx);
@@ -2391,14 +2392,13 @@ static void kcryptd_io_write(struct dm_crypt_io *io)
 	struct bio *prev = NULL;
 	int tag_idx = 0;
 	sector_t sector = io->base_bio->bi_iter.bi_sector;
-	unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 
 	//sprintk("Entering kcryptd_io_write IO address %p, sector %d, clone sector %d, pages_head %p", io, sector, clone->bi_iter.bi_sector, io->pages_head);
 	if (io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 		struct io_bio_vec *temp = io->pages_head;
 		int i = 0;
 		while(temp) {
-			unsigned int nr_iovecs = ((num_sectors * cc->sector_size) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+			unsigned int nr_iovecs = ((NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * cc->sector_size) + PAGE_SIZE - 1) >> PAGE_SHIFT;
 			struct bio *bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_WRITE, GFP_NOIO, &cc->bs);
 
 			bio->bi_iter.bi_sector = io->freelist[i][0].start;
@@ -2656,8 +2656,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 	else if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
 		unsigned int size;
 		unsigned total_copied = 0;
-		unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
-		size = num_sectors * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
+		size = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * bio_sectors(io->base_bio) * cc->on_disk_tag_size;
 
 		clone = crypt_alloc_buffer(io, size, 0);
 		if (unlikely(!clone)) {
@@ -2671,23 +2670,31 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		struct bvec_iter iter_in = io->base_bio->bi_iter;
 		struct bvec_iter iter_out = clone->bi_iter;
 		unsigned int sector_num = iter_in.bi_sector;
+		bool is_first_iv = true;
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->base_bio, iter_in);
 			struct bio_vec bv_out = bio_iter_iovec(clone, iter_out);
 			char *sbuffer = kmap_atomic(bv_in.bv_page);
 			char *dbuffer = page_to_virt(bv_out.bv_page);
-			unsigned char sequence_number;
+			unsigned short sequence_number;
+			int HIDDEN_BYTES_PER_TAG;
+
 			if (map_find(sector_num, &sequence_number) == -1)
 				sequence_number = 1;
 			else
 				sequence_number++;
 
+			if (is_first_iv)
+				HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
+			else
+				HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_REST_IVS;
+
 			unsigned copy_bytes = min_t(unsigned, HIDDEN_BYTES_PER_TAG, iter_in.bi_size);
 			if (total_copied + copy_bytes > cc->sector_size)
 				copy_bytes = cc->sector_size - total_copied; //always be on sector_size boundary 
 
-			if (bv_in.bv_len < copy_bytes) {
-				unsigned small_copy = bv_in.bv_len;
+			if (bv_in.bv_len < copy_bytes) { //page boundary
+				unsigned small_copy = bv_in.bv_len; //amount of space left in the page
 				memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, small_copy);
 				kunmap_atomic(sbuffer);
 				bio_advance_iter(io->base_bio, &iter_in, small_copy);
@@ -2699,12 +2706,20 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			else {
 				memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 			}
-			/* Hiddenbytes | Sector Num | Sequence Number | RandomBytes | Magic */
-			sprintk("kcryptd_crypt_write_convert, logical sector number %d, sector sequence number %d\n", sector_num, sequence_number);
-			memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);
-			dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN] = sequence_number;
-			get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
-			dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+
+			if (is_first_iv) {
+				/* Hiddenbytes | Sector Num | Sequence Number | RandomBytes | Magic */
+				sprintk("kcryptd_crypt_write_convert, logical sector number %d, sector sequence number %d\n", sector_num, sequence_number);
+				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);
+				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sequence_number, SEQUENCE_NUMBER_LEN);
+				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+				is_first_iv = false;
+			}
+			else {
+				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+			}
 
 			bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
 			bio_advance_iter(clone, &iter_out, cc->on_disk_tag_size);
@@ -2713,10 +2728,11 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			if (total_copied == cc->sector_size) {
 				total_copied = 0;
 				sector_num++;
+				is_first_iv = true;
 			}
 		}
 
-		crypt_convert_init(cc, ctx, clone, clone, num_sectors * sector, &tag_offset);
+		crypt_convert_init(cc, ctx, clone, clone, NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * sector, &tag_offset);
 		// we don't do the encryption now as we dont have the mapping physical sectors
 		// yet. Instead we do the encryption in read_convert
 
@@ -2897,11 +2913,19 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 				io->ctx.bio_out->bi_iter.bi_size, io->base_bio->bi_iter.bi_size); 
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
 		struct bvec_iter iter_out = io->base_bio->bi_iter;
+		bool is_first_iv = true;
 		while (iter_out.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			struct bio_vec bv_out = bio_iter_iovec(io->base_bio, iter_out);
 			char *sbuffer = page_to_virt(bv_in.bv_page);
 			char *dbuffer = kmap_atomic(bv_out.bv_page);
+			int HIDDEN_BYTES_PER_TAG;
+
+                        if (is_first_iv)
+                                HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
+                        else
+                                HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_REST_IVS;
+
 			unsigned copy_bytes = min_t(unsigned, HIDDEN_BYTES_PER_TAG, iter_out.bi_size);
 			if (total_copied + copy_bytes > cc->sector_size)
 				copy_bytes = cc->sector_size - total_copied; 
@@ -2926,8 +2950,11 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
 			kunmap_atomic(dbuffer);
 			total_copied += copy_bytes;
-			if (total_copied == cc->sector_size)
+			is_first_iv = false;
+			if (total_copied == cc->sector_size) {
 				total_copied = 0;
+				is_first_iv = true;
+			}
 			//sprintk("kcryptd_crypt_read_convert, remaining input size %d, remaining hidden data size %d\n", iter_out.bi_size, iter_in.bi_size);
 		}
 		//print_bio("Inside kcryptd_crypt_read_convert base bio", io->base_bio);
@@ -2938,26 +2965,26 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		unsigned sector = io->write_bio->bi_iter.bi_sector;
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
-		unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 		//print_freelist();
 		//print_bio("kcryptd_crypt_read_convert, pub write, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			bool found = false;
+			int HIDDEN_BYTES_PER_TAG = 10;
 
 			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
                         	unsigned sector_num = 0;
-                        	unsigned char sequence_num = 0;
-				unsigned char current_sequence_num;
+                        	unsigned short sequence_num = 0;
+				unsigned short current_sequence_num;
 
                         	memcpy(&sector_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
-                        	sequence_num =  (unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
+                        	memcpy(&sequence_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
 				//get the mapped physical sector number for this logical sector
 				if (map_find(sector_num, &current_sequence_num) != -1) {
 					if (sequence_num != current_sequence_num)
 						found = false;
-					else if(sector_num <= sector && sector < sector_num + num_sectors)
+					else if(sector_num <= sector && sector < sector_num + NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR)
 						found = true;
 				}
 				else {
@@ -4118,7 +4145,7 @@ void process_map_data(struct crypt_config *cc)
 	struct page *page;
 	int ret = 0;
 	unsigned max_sectors = 0;
-	unsigned num_sectors;
+	unsigned act_sectors;
 
 	get_map_data(0, 0, 0, &max_sectors); 
 	printk("process_map_data, max_sectors %d\n", max_sectors);
@@ -4159,8 +4186,8 @@ void process_map_data(struct crypt_config *cc)
 	io->flags |= PD_HIDDEN_OPERATION | PD_READ_MAP_DATA;
 
 	while(current_sector < max_sectors) {
-		num_sectors = min((sector_t)CHUNK_NUM_SECTORS, max_sectors - current_sector);
-		tag_size = num_sectors * cc->on_disk_tag_size;
+		act_sectors = min((sector_t)CHUNK_NUM_SECTORS, max_sectors - current_sector);
+		tag_size = act_sectors * cc->on_disk_tag_size;
 		memset(tag, 0, tag_size);
 		get_map_data(current_sector, tag, tag_size, NULL);
 		//sprintk("process_map_data sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
@@ -4196,13 +4223,14 @@ void process_map_data(struct crypt_config *cc)
                         struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                         char *buffer = page_to_virt(bv_out.bv_page);
 			unsigned sector_num = 0;
-			unsigned char sequence_num = 0;
+			unsigned short sequence_num = 0;
+			int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
 
 			if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
                         	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
 				sequence_num =  (unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
 
-	                        unsigned char current_sequence_num;
+	                        unsigned short current_sequence_num;
         	                if (map_find(sector_num, &current_sequence_num) != -1) {
                 	                if(sequence_num > current_sequence_num) {
 				        	//sprintk("process_map_data, logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
@@ -4222,7 +4250,7 @@ void process_map_data(struct crypt_config *cc)
 			pub_sector++;
                 }
 
-		current_sector += num_sectors;
+		current_sector += act_sectors;
 		tag_offset = 0;
 	}
 
@@ -4518,8 +4546,7 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	if (cc->on_disk_tag_size) {
 		unsigned tag_len;
 		if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags)) {
-			unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
-			tag_len = num_sectors * bio_sectors(bio) * cc->on_disk_tag_size;
+			tag_len = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR * bio_sectors(bio) * cc->on_disk_tag_size;
 		}
 		else
 			tag_len = cc->on_disk_tag_size * (bio_sectors(bio) >> cc->sector_shift);
