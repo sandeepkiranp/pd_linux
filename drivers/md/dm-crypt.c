@@ -100,13 +100,16 @@ enum cipher_flags {
 #define IV_SIZE 16
 #define SECTOR_NUM_LEN	   4
 #define SEQUENCE_NUMBER_LEN	2
+#define IV_OFFSET_LEN 1
+#define IV_OFFSET_POS 12
 #define RANDOM_BYTES_PER_TAG 2
 #define PD_MAGIC_DATA		0xAA
 #define PD_MAGIC_DATA_SIZE 1 
+#define PD_MAGIC_DATA_POS 15
 #define CHUNK_NUM_SECTORS 32768 
-#define HIDDEN_BYTES_IN_FIRST_IV (IV_SIZE - PD_MAGIC_DATA_SIZE - RANDOM_BYTES_PER_TAG - SEQUENCE_NUMBER_LEN - SECTOR_NUM_LEN)
-#define HIDDEN_BYTES_IN_REST_IVS (IV_SIZE - PD_MAGIC_DATA_SIZE - RANDOM_BYTES_PER_TAG) 
-#define NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR 40 // ( 1 + 512/HIDDEN_BYTES_IN_REST_IVS)
+#define HIDDEN_BYTES_IN_FIRST_IV (IV_SIZE - PD_MAGIC_DATA_SIZE - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN - SEQUENCE_NUMBER_LEN - SECTOR_NUM_LEN) //6
+#define HIDDEN_BYTES_IN_REST_IVS (IV_SIZE - PD_MAGIC_DATA_SIZE - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN)  //12
+#define NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR 44 // ( 1 + (512 - HIDDEN_BYTES_IN_FIRST_IV) /HIDDEN_BYTES_IN_REST_IVS)
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
 static unsigned dm_crypt_clients_n = 0;
@@ -125,7 +128,8 @@ static bool crypt_integrity_aead(struct crypt_config *cc);
 
 struct file *bio_file = NULL;
 extern void get_map_data(sector_t sector, char *tag, int tag_size, unsigned *max_sectors);
-void process_map_data(struct crypt_config *cc);
+static void process_map_data(struct crypt_config *cc);
+static void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char *tag, int tag_size);
 
 #define sprintk(f_, ...) 
 
@@ -2671,6 +2675,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		struct bvec_iter iter_out = clone->bi_iter;
 		unsigned int sector_num = iter_in.bi_sector;
 		bool is_first_iv = true;
+		unsigned char iv_offset = 0;
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->base_bio, iter_in);
 			struct bio_vec bv_out = bio_iter_iovec(clone, iter_out);
@@ -2708,17 +2713,19 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			}
 
 			if (is_first_iv) {
-				/* Hiddenbytes | Sector Num | Sequence Number | RandomBytes | Magic */
+				/* Hiddenbytes | Sector Num | Sequence Number | IV offset | RandomBytes | Magic */
 				sprintk("kcryptd_crypt_write_convert, logical sector number %d, sector sequence number %d\n", sector_num, sequence_number);
 				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);
 				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sequence_number, SEQUENCE_NUMBER_LEN);
-				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN, RANDOM_BYTES_PER_TAG);
-				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN] = iv_offset;
+				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN, RANDOM_BYTES_PER_TAG);
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 				is_first_iv = false;
 			}
 			else {
-				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
-				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG] = iv_offset;
+				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN, RANDOM_BYTES_PER_TAG);
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG  + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 			}
 
 			bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
@@ -2729,6 +2736,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 				total_copied = 0;
 				sector_num++;
 				is_first_iv = true;
+				iv_offset = 0;
 			}
 		}
 
@@ -2971,15 +2979,31 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			bool found = false;
-			int HIDDEN_BYTES_PER_TAG = 10;
+			int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
 
-			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			if((unsigned char)buffer[bv_in.bv_offset + PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
                         	unsigned sector_num = 0;
                         	unsigned short sequence_num = 0;
 				unsigned short current_sequence_num;
+				unsigned char iv_offset = (unsigned char)buffer[bv_in.bv_offset + IV_OFFSET_POS];
 
-                        	memcpy(&sector_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
-                        	memcpy(&sequence_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+				if (iv_offset == 0) {
+                        		memcpy(&sector_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                        		memcpy(&sequence_num, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+				}
+				else { 
+					//we landed in some other offset. Get to the 0th offset to extract sector and sequence numbers
+					unsigned char iv[16];
+					printk("kcryptd_crypt_read_convert, pub write, we are at IV offset %d for sector %d", iv_offset, sector);
+					get_ivs_from_sector(io, sector - iv_offset, iv, sizeof(iv));
+					iv_offset = (unsigned char)iv[IV_OFFSET_POS];	
+					//make sure we are at 0th offset
+					if (iv_offset != 0) {
+						//return error
+					}
+                        		memcpy(&sector_num, iv + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                        		memcpy(&sequence_num, iv + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+				}
 				//get the mapped physical sector number for this logical sector
 				if (map_find(sector_num, &current_sequence_num) != -1) {
 					if (sequence_num != current_sequence_num)
@@ -4129,6 +4153,79 @@ static int crypt_report_zones(struct dm_target *ti,
 #define crypt_report_zones NULL
 #endif
 
+
+//gets IV data for sectors starting from "sector". Count should not exceed 32768
+void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char *tag, int tag_size)
+{
+	struct crypt_config *cc = io->cc;
+        int nr_iovecs = (tag_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+        struct bio *bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_READ, GFP_NOIO, &cc->bs);
+	unsigned int flags = io->flags;
+	unsigned i, len, remaining_size;
+	struct page *page;
+	gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
+	int r = 0;
+	int tag_offset = 0;
+
+        if (unlikely(!bio)) {
+                io->error = BLK_STS_IOERR;
+                sprintk("process_map_data, Error allocating bio");
+                return;
+        }
+        remaining_size = tag_size;
+
+        for (i = 0; i < nr_iovecs; i++) {
+                page = mempool_alloc(&cc->page_pool, gfp_mask);
+                if (!page) {
+                        sprintk("Error allocating a page");
+                        return;
+                }
+
+                len = (remaining_size > PAGE_SIZE) ? PAGE_SIZE : remaining_size;
+
+                r = bio_add_page(bio, page, len, 0);
+
+                remaining_size -= len;
+        }
+        bio->bi_opf = REQ_OP_READ;
+        io->flags = PD_HIDDEN_OPERATION | PD_READ_MAP_DATA;
+
+	memset(tag, 0, tag_size);
+	get_map_data(sector, tag, tag_size, NULL);
+
+        struct bvec_iter iter_out = bio->bi_iter;
+        unsigned offset = 0;
+        while (iter_out.bi_size) {
+              struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+              char *buffer = page_to_virt(bv_out.bv_page);
+
+              memcpy(buffer + bv_out.bv_offset, tag + offset, cc->on_disk_tag_size);
+              bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
+              offset += cc->on_disk_tag_size;
+        }
+        crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
+        r = crypt_convert(cc, &io->ctx,
+                          test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+        if (r){
+              sprintk("crypt_convert failed");
+              io->error = r; //TODO: free everything and return failure
+        }
+        iter_out = bio->bi_iter;
+        offset = 0;
+        //print_bio("Data during initialization", bio);
+        while (iter_out.bi_size) {
+            struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+            char *buffer = page_to_virt(bv_out.bv_page);
+	    memcpy(tag + offset, buffer, cc->on_disk_tag_size);
+            bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
+            offset += cc->on_disk_tag_size;
+         }
+
+	io->flags = flags;
+        crypt_free_buffer_pages(cc, bio);
+        bio_put(bio);
+}
+
 void process_map_data(struct crypt_config *cc)
 {
 	char *tag;
@@ -4226,7 +4323,7 @@ void process_map_data(struct crypt_config *cc)
 			unsigned short sequence_num = 0;
 			int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
 
-			if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
                         	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
 				sequence_num =  (unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
 
@@ -4483,8 +4580,8 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
 
-	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
-		process_map_data(cc);
+	//if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
+	//	process_map_data(cc);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
