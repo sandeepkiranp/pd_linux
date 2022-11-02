@@ -131,7 +131,7 @@ struct file *bio_file = NULL;
 extern void get_map_data(sector_t sector, char *tag, int tag_size, unsigned *max_sectors);
 static void process_map_data(struct crypt_config *cc);
 static void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char *tag, int tag_size);
-
+static int read_sector_metadata(struct dm_crypt_io *io, struct bio *base_bio, sector_t sector, unsigned char *data, unsigned size);
 //#define printk(f_, ...) 
 
 void print_integrity_metadata(char *msg, char *data)
@@ -2991,6 +2991,11 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			bool found = false;
 			int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
 
+	                char *str = print_binary_data(buffer + bv_in.bv_offset, cc->iv_size);
+       		        printk("kcryptd_crypt_read_convert, IV from pub read of sector %d %s\n", sector, str);
+                	kfree(str);
+
+
 			if((unsigned char)buffer[bv_in.bv_offset + PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
                         	unsigned sector_num = 0;
                         	unsigned short sequence_num = 0;
@@ -3017,7 +3022,10 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                                                 return;
                                         }
 
-					get_ivs_from_sector(io, sector - iv_offset, iv, sizeof(iv));
+					read_sector_metadata(io, io->write_bio, sector - iv_offset, iv, sizeof(iv));
+	                		str = print_binary_data(iv, cc->iv_size);
+		       		        printk("kcryptd_crypt_read_convert, IV from offset read sector %d %s\n", sector - iv_offset, str);
+		                	kfree(str);
 					iv_offset = (unsigned char)iv[IV_OFFSET_POS];	
 					//make sure we are at 0th offset
 					if (iv_offset != 0) {
@@ -3031,14 +3039,19 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 					}
                         		memcpy(&sector_num, iv + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
                         		memcpy(&sequence_num, iv + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+					printk("cryptd_crypt_read_convert, pub write we got sector %d, sequence %d from 0th IV\n", sector_num, sequence_num);
 				}
 				//get the mapped physical sector number for this logical sector
 				if ((phy_sector = map_find(sector_num, &current_sequence_num)) != -1) {
 					if (sequence_num == current_sequence_num)
 						found = true;
+					printk("cryptd_crypt_read_convert, pub write, logical sector %d, physical sector %d, seq num %d, mapped seq num %d\n",
+						sector_num, phy_sector, sequence_num, current_sequence_num);
 				}
-			}
+				else
+					printk("cryptd_crypt_read_convert, pub write, map_find failed for %d\n", sector_num);
 
+			}
 			if (found) {
                                 //refresh the randomness        
                                 printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV for sector %d\n", sector);
@@ -3046,7 +3059,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			}
 			else {
 				printk("No hidden data present (magic %02hhx) or stale hidden data, generating random IV for sector %d\n", 
-						buffer[bv_in.bv_offset + PD_MAGIC_DATA_POS], sector);
+						(unsigned char)buffer[bv_in.bv_offset + PD_MAGIC_DATA_POS], sector);
                                 //fill random bytes in IV
                                 get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
                                 spin_lock(&freelist_lock);
@@ -4249,6 +4262,80 @@ void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char 
         crypt_free_buffer_pages(cc, bio);
         bio_put(bio);
 }
+
+static void map_endio(struct bio *clone)
+{
+        struct dm_crypt_io *io = clone->bi_private;
+        struct crypt_config *cc = io->cc;
+        unsigned rw = bio_data_dir(clone);
+
+        //printk("Inside map_endio IO address %p, IO flags %d, size= %d, starting sector = %d, direction %s\n",
+        //               io, io->flags, clone->bi_iter.bi_size, clone->bi_iter.bi_sector, (rw == WRITE) ? "WRITE" : "READ");
+        complete(&io->map_complete);
+}
+
+static int read_sector_metadata(struct dm_crypt_io *io, struct bio *base_bio, sector_t sector, unsigned char *data, unsigned size)
+{
+        int ret = 0;
+        int r;
+        struct crypt_config *cc = io->cc;
+        unsigned int flags = io->flags;
+        struct convert_context lctx = io->ctx;
+
+
+                // Read equivalent data sectors along with integrity metadata
+                int tag_offset = 0;
+                unsigned len = (size / cc->on_disk_tag_size) * cc->sector_size;
+                struct bio *bio = crypt_alloc_buffer(io, len, 0);
+                bio->bi_private = io;
+                bio->bi_end_io = map_endio;
+                bio->bi_opf = REQ_OP_READ | REQ_INTEGRITY;
+                bio->bi_iter.bi_sector = sector;
+                crypt_inc_pending(io);
+                dm_submit_bio_remap(base_bio, bio);
+                wait_for_completion(&io->map_complete);
+                reinit_completion(&io->map_complete);
+
+                //decrypt the integrity metadata
+                struct bio *hbio = crypt_alloc_buffer(io, size, 0);
+                struct bvec_iter iter_out = hbio->bi_iter;
+                unsigned offset = 0;
+                while (iter_out.bi_size) {
+                        struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
+                        char *buffer = page_to_virt(bv_out.bv_page);
+
+                        memcpy(buffer + bv_out.bv_offset, io->integrity_metadata + offset, size);
+                        bio_advance_iter(hbio, &iter_out, size);
+                        offset += size;
+                }
+                hbio->bi_opf = REQ_OP_READ;
+                io->flags = PD_HIDDEN_OPERATION | PD_READ_MAP_DATA;
+                crypt_convert_init(cc, &io->ctx, hbio, hbio, sector, &tag_offset);
+                r = crypt_convert(cc, &io->ctx, false, true);
+
+                // copy decrypted data to output
+                iter_out = hbio->bi_iter;
+                offset = 0;
+                while (iter_out.bi_size) {
+                        struct bio_vec bv_out = bio_iter_iovec(hbio, iter_out);
+                        char *buffer = page_to_virt(bv_out.bv_page);
+
+                        memcpy(data + offset, buffer + bv_out.bv_offset, size);
+                        bio_advance_iter(hbio, &iter_out, size);
+                        offset += size;
+                }
+                crypt_free_buffer_pages(cc, bio);
+                bio_put(bio);
+                crypt_free_buffer_pages(cc, hbio);
+                bio_put(hbio);
+                crypt_dec_pending(io);
+        //restore old io values
+        io->flags = flags;
+        io->ctx = lctx;
+
+        return ret;
+}
+
 
 void process_map_data(struct crypt_config *cc)
 {
