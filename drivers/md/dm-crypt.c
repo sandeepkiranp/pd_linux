@@ -132,6 +132,7 @@ extern void get_map_data(sector_t sector, char *tag, int tag_size, unsigned *max
 static void process_map_data(struct crypt_config *cc);
 static void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char *tag, int tag_size);
 static int read_sector_metadata(struct dm_crypt_io *io, struct bio *base_bio, sector_t sector, unsigned char *data, unsigned size);
+
 //#define printk(f_, ...) 
 
 void print_integrity_metadata(char *msg, char *data)
@@ -2727,13 +2728,13 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sector_num, SECTOR_NUM_LEN);
 				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, &sequence_number, SEQUENCE_NUMBER_LEN);
 				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN] = iv_offset;
-				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN, RANDOM_BYTES_PER_TAG);
+				memset(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN, 0, RANDOM_BYTES_PER_TAG);
 				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 				is_first_iv = false;
 			}
 			else {
 				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG] = iv_offset;
-				get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN, RANDOM_BYTES_PER_TAG);
+				memset(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN, 0, RANDOM_BYTES_PER_TAG);
 				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG  + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 			}
 
@@ -3048,14 +3049,18 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 					printk("cryptd_crypt_read_convert, pub write, logical sector %d, physical sector %d, seq num %d, mapped seq num %d\n",
 						sector_num, phy_sector, sequence_num, current_sequence_num);
 				}
-				else
+				else {
 					printk("cryptd_crypt_read_convert, pub write, map_find failed for %d\n", sector_num);
+				}
 
 			}
 			if (found) {
+				unsigned short counter = 0;
+				memcpy(&counter, buffer + bv_in.bv_offset + RANDOM_BYTES_POS, RANDOM_BYTES_PER_TAG);
+				counter++;
                                 //refresh the randomness        
-                                printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV for sector %d\n", sector);
-                                get_random_bytes(buffer + bv_in.bv_offset + RANDOM_BYTES_POS, RANDOM_BYTES_PER_TAG);
+                                printk("Inside kcryptd_crypt_read_convert, incrementing public write counter in IV for sector %d to %d\n", sector, counter);
+                                memcpy(buffer + bv_in.bv_offset + RANDOM_BYTES_POS, &counter, RANDOM_BYTES_PER_TAG);
 			}
 			else {
 				printk("No hidden data present (magic %02hhx) or stale hidden data, generating random IV for sector %d\n", 
@@ -4204,7 +4209,7 @@ void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char 
 
         if (unlikely(!bio)) {
                 io->error = BLK_STS_IOERR;
-                printk("process_map_data, Error allocating bio");
+                printk("get_ivs_from_sector, Error allocating bio");
                 return;
         }
         remaining_size = tag_size;
@@ -4434,7 +4439,7 @@ void process_map_data(struct crypt_config *cc)
 			unsigned short sequence_num = 0;
 			int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
 
-			if ((unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
+			if ((unsigned char)buffer[bv_out.bv_offset + PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
                         	memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
 				sequence_num =  (unsigned char)buffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN];
 
