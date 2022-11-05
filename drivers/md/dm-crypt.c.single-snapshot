@@ -248,8 +248,8 @@ struct crypt_config {
 #define MAX_TAG_SIZE	480
 #define POOL_ENTRY_SIZE	512
 
-#define HIDDEN_BYTES_PER_TAG 14
-#define RANDOM_BYTES_PER_TAG 1
+#define HIDDEN_BYTES_PER_TAG 13
+#define RANDOM_BYTES_PER_TAG 2
 #define PD_MAGIC_DATA        0xAA
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
@@ -2549,7 +2549,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		        /* Hiddenbytes | RandomBytes | Magic */
                         memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 		    }
-		    get_random_bytes(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
+		    memset(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, 0, RANDOM_BYTES_PER_TAG);
 		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 
                     bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
@@ -2785,10 +2785,12 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
-				printk("Inside kcryptd_crypt_read_convert, refreshing randomness in IV\n");
-				//refresh the randomness	
-		                get_random_bytes(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
-
+				unsigned short counter = 0;
+				memcpy(&counter, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
+				counter++;
+                                //increment the public counter
+                                printk("Inside kcryptd_crypt_read_convert, incrementing public write counter in IV for sector %d to %d\n", sector, counter);
+                                memcpy(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, &counter, RANDOM_BYTES_PER_TAG);
 			}
 			else {
 				printk("No hidden data present (magic %02hhx), generating random IV\n", buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG]);
