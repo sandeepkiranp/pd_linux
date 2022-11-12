@@ -46,6 +46,8 @@
 #include <asm/uaccess.h>
 #include <linux/buffer_head.h>
 #include <linux/idr.h>
+#include <linux/module.h>
+#include <crypto/hash.h>
 
 #include "dm-audit.h"
 #include "dm-crypt.h"
@@ -92,6 +94,7 @@ enum cipher_flags {
 	CRYPT_IV_LARGE_SECTORS,		/* Calculate IV from sector_size, not 512B sectors */
 	CRYPT_ENCRYPT_PREPROCESS,	/* Must preprocess data for encryption (elephant) */
 };
+
 
 #define MIN_IOS		64
 #define MAX_TAG_SIZE	480
@@ -217,6 +220,44 @@ void print_bio(char *msg, struct bio *bio)
 	}
 	if (p)
 		kfree(p);
+}
+
+
+typedef struct dirty_public_list {
+	sector_t sector;
+	struct dirty_public_list *next;
+}dirty_public_list;
+
+struct dirty_public_list *head_dirtylist = NULL;
+struct dirty_public_list *tail_dirtylist = NULL;
+
+bool findin_dirty_list(sector_t sector)
+{
+        struct dirty_public_list *temp = head_dirtylist;
+
+        while(temp) {
+                if (temp->sector == sector)
+                        return true;
+		temp = temp->next;
+        }
+        return false;
+}
+
+void addto_dirty_list(sector_t sector)
+{
+        //printk("dirty_public_list entry, inserting %d", sector);
+	if (findin_dirty_list(sector))
+		return;
+        struct dirty_public_list *node = kmalloc(sizeof(struct dirty_public_list), GFP_KERNEL);
+        node->sector = sector;
+        node->next = NULL;
+
+        if (head_dirtylist == NULL) {
+                head_dirtylist = tail_dirtylist = node;
+                return;
+        }
+	tail_dirtylist->next = node;
+	tail_dirtylist = node;
 }
 
 struct freelist {
@@ -2989,6 +3030,11 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		//print_freelist();
 		//print_bio("kcryptd_crypt_read_convert, pub write, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
+			//ideally we would have liked not to decrypt this IV and re-encrypt it back
+			// but since the input may have dirty and non-dirty sectors, we take a decision here. 
+			// TODO: see if we can somehow not decrypt the IV of dirty sector
+			if (findin_dirty_list(sector))
+				goto advance;
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			bool found = false;
@@ -3065,6 +3111,7 @@ next:
                                 //increment the public counter
                                 printk("Inside kcryptd_crypt_read_convert, incrementing public write counter in IV for sector %d to %d\n", sector, counter);
                                 memcpy(buffer + bv_in.bv_offset + RANDOM_BYTES_POS, &counter, RANDOM_BYTES_PER_TAG);
+				addto_dirty_list(sector);
 			}
 			else {
 				printk("No hidden data present (magic %02hhx) or stale hidden data, generating random IV for sector %d\n", 
@@ -3075,7 +3122,7 @@ next:
                                 addto_freelist(sector);
                                 spin_unlock(&freelist_lock);
 			}
-
+advance:
 			bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
 			sector++;
 		}
@@ -4345,14 +4392,64 @@ static int read_sector_metadata(struct dm_crypt_io *io, struct bio *base_bio, se
         return ret;
 }
 
+struct sdesc {
+    struct shash_desc shash;
+    char ctx[];
+};
+
+static struct sdesc *init_sdesc(struct crypto_shash *alg)
+{
+    struct sdesc *sdesc;
+    int size;
+
+    size = sizeof(struct shash_desc) + crypto_shash_descsize(alg);
+    sdesc = kmalloc(size, GFP_KERNEL);
+    if (!sdesc)
+        return ERR_PTR(-ENOMEM);
+    sdesc->shash.tfm = alg;
+    return sdesc;
+}
+
+static int calc_hash(struct crypto_shash *alg,
+             const unsigned char *data, unsigned int datalen,
+             unsigned char *digest)
+{
+    struct sdesc *sdesc;
+    int ret;
+
+    sdesc = init_sdesc(alg);
+    if (IS_ERR(sdesc)) {
+        pr_info("can't alloc sdesc\n");
+        return PTR_ERR(sdesc);
+    }
+
+    ret = crypto_shash_digest(&sdesc->shash, data, datalen, digest);
+    kfree(sdesc);
+    return ret;
+}
+
+static int test_hash(const unsigned char *data, unsigned int datalen,
+             unsigned char *digest)
+{
+    struct crypto_shash *alg;
+    char *hash_alg_name = "sha256";
+    int ret;
+
+    alg = crypto_alloc_shash(hash_alg_name, 0, 0);
+    if (IS_ERR(alg)) {
+            pr_info("can't alloc alg %s\n", hash_alg_name);
+            return PTR_ERR(alg);
+    }
+    ret = calc_hash(alg, data, datalen, digest);
+    crypto_free_shash(alg);
+    return ret;
+}
 
 void process_map_data(struct crypt_config *cc)
 {
 	char *tag;
 	sector_t current_sector = 0;
 	struct dm_crypt_io *io; //dummy io object. needed as crypt_convert depends on it for few members. not elegant
-	struct aead_request aead_req;
-	struct skcipher_request skc_req;
 	int tag_offset = 0;
 	int tag_size, r;
 	struct bio *bio;
@@ -4430,6 +4527,7 @@ void process_map_data(struct crypt_config *cc)
 			bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
 			offset += cc->on_disk_tag_size;
 		}
+		
 		crypt_convert_init(cc, &io->ctx, bio, bio, current_sector, &tag_offset);
 		r = crypt_convert(cc, &io->ctx,
 				test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
