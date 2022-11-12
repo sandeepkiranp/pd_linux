@@ -237,11 +237,31 @@ bool findin_dirty_list(sector_t sector)
         struct dirty_public_list *temp = head_dirtylist;
 
         while(temp) {
+		//printk("Dirty List input sector %d, has sector %d\n", sector, temp->sector);
                 if (temp->sector == sector)
                         return true;
 		temp = temp->next;
         }
         return false;
+}
+
+void removefrom_dirty_list(sector_t sector)
+{
+        struct dirty_public_list *temp = head_dirtylist;
+        struct dirty_public_list *prev = head_dirtylist;
+
+        while(temp) {
+                //printk("Dirty List input sector %d, has sector %d\n", sector, temp->sector);
+                if (temp->sector == sector) {
+			if (temp == head_dirtylist)
+				head_dirtylist = head_dirtylist->next;
+			prev->next = temp->next;
+			kfree(temp);
+			return;
+		}
+		prev = temp;
+                temp = temp->next;
+        }
 }
 
 void addto_dirty_list(sector_t sector)
@@ -2414,14 +2434,17 @@ static void kcryptd_io_rdwr_map(struct dm_crypt_io *io)
 {
 	int i, j;
 	unsigned sector = io->base_bio->bi_iter.bi_sector;
+	bool reuse_physical_sector = false;
 
 	//printk("Inside kcryptd_io_rdwr_map %p\n", work);
 
 	if (!io->freelist)
 		goto ret;
 	for(i = 0; i < bio_sectors(io->base_bio); i++) {
-		if (map_insert(sector, io->freelist[i][0].start, NULL, true))
-			printk("kcryptd_io_rdwr_map, error inserting key %d, value %d into map", sector, io->freelist[i][0].start);
+		if (map_find(sector, NULL, &reuse_physical_sector) == -1 || !reuse_physical_sector) {
+			if (map_insert(sector, io->freelist[i][0].start, NULL, true))
+				printk("kcryptd_io_rdwr_map, error inserting key %d, value %d into map", sector, io->freelist[i][0].start);
+		}
 		sector++;
 	}
 ret:
@@ -2745,10 +2768,11 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			char *dbuffer = page_to_virt(bv_out.bv_page);
 			unsigned short sequence_number;
 			int HIDDEN_BYTES_PER_TAG;
+			bool reuse_physical_sector = false;
 
-			if (map_find(sector_num, &sequence_number, NULL) == -1)
+			if (map_find(sector_num, &sequence_number, &reuse_physical_sector) == -1)
 				sequence_number = 1;
-			else
+			else if (!reuse_physical_sector) 
 				sequence_number++;
 
 			if (is_first_iv)
@@ -3041,13 +3065,6 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 		//print_freelist();
 		//print_bio("kcryptd_crypt_read_convert, pub write, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
-			//ideally we would have liked not to decrypt this IV and re-encrypt it back
-			// but since the input may have dirty and non-dirty sectors, we take a decision here. 
-			// TODO: see if we can somehow not decrypt the IV of dirty sector
-			if (findin_dirty_list(sector)) {
-				printk("kcryptd_crypt_read_convert, pub write, sector %d found in dirty list. Skipping!", sector);
-				goto advance;
-			}
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			bool found = false;
@@ -3119,6 +3136,11 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 next:
 			if (found) {
 				unsigned short counter = 0;
+				//increment counter only if not in dirty list
+				if (findin_dirty_list(sector)) {
+					printk("kcryptd_crypt_read_convert, pub write, sector %d found in dirty list. Skipping!", sector);
+					goto advance;
+				}
 				memcpy(&counter, buffer + bv_in.bv_offset + RANDOM_BYTES_POS, RANDOM_BYTES_PER_TAG);
 				counter++;
                                 //increment the public counter
@@ -3129,6 +3151,8 @@ next:
 			else {
 				printk("No hidden data present (magic %02hhx) or stale hidden data, generating random IV for sector %d\n", 
 						(unsigned char)buffer[bv_in.bv_offset + PD_MAGIC_DATA_POS], sector);
+				//remove this sector from dirty list if it exists
+				removefrom_dirty_list(sector);
                                 //fill random bytes in IV
                                 get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
                                 spin_lock(&freelist_lock);
