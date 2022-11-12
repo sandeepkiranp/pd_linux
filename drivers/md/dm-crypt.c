@@ -114,6 +114,7 @@ enum cipher_flags {
 #define HIDDEN_BYTES_IN_FIRST_IV (IV_SIZE - PD_MAGIC_DATA_LEN - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN - SEQUENCE_NUMBER_LEN - SECTOR_NUM_LEN) //6
 #define HIDDEN_BYTES_IN_REST_IVS (IV_SIZE - PD_MAGIC_DATA_LEN - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN)  //12
 #define NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR 44 // ( 1 + (512 - HIDDEN_BYTES_IN_FIRST_IV) /HIDDEN_BYTES_IN_REST_IVS)
+#define REUSE_PHYSICAL_BIT 48
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
 static unsigned dm_crypt_clients_n = 0;
@@ -2210,7 +2211,7 @@ static void io_add_bio_vec(struct dm_crypt_io *io, struct bio_vec *bv)
 	io->pages_tail = temp;
 }
 
-int map_insert(unsigned sector, unsigned value, unsigned short *lseq_num)
+int map_insert(unsigned sector, unsigned value, unsigned short *lseq_num, bool reuse_physical_sector)
 {
 	int r;
 	unsigned short seq_num = 0;
@@ -2230,6 +2231,8 @@ int map_insert(unsigned sector, unsigned value, unsigned short *lseq_num)
 		seq_num++;
 	complete = seq_num;
 	complete = complete << 32 | value;
+	if (reuse_physical_sector)
+		complete = complete | ((unsigned long)1 << REUSE_PHYSICAL_BIT);
 	r = idr_alloc(&map_idr, (void *)complete, sector, sector + 1, GFP_NOWAIT);
 
 	spin_unlock(&map_lock);
@@ -2240,7 +2243,7 @@ int map_insert(unsigned sector, unsigned value, unsigned short *lseq_num)
 	return 0;
 }
 
-int map_find(unsigned sector, unsigned short *seq_num)
+int map_find(unsigned sector, unsigned short *seq_num, bool *reuse_physical_sector)
 {
 	int value = 0;
 	unsigned short lseq_num = 0;
@@ -2256,6 +2259,8 @@ int map_find(unsigned sector, unsigned short *seq_num)
 		//printk("map_find, retrieved key %d, value %d, seq_num %d, complete %ld", sector, value, lseq_num, complete);
 		if (seq_num)
 			*seq_num = lseq_num;
+		if (reuse_physical_sector)
+			*reuse_physical_sector = complete & ((unsigned long)1 << REUSE_PHYSICAL_BIT); 
 		return value;
 	}
 }
@@ -2284,6 +2289,7 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 
 		for (i = 0; i < bio_sectors(io->base_bio); i++) {
 			int j = 0;
+			bool reuse_public_sector = false;
 			// read list of sectors from freelist
 			if(io->flags & PD_READ_DURING_HIDDEN_WRITE) {
 				// TEST //
@@ -2293,33 +2299,38 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 					addto_freelist((i + io->base_bio->bi_iter.bi_sector)*NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR + k);
 				}
 				// TEST //
-				printk("kcryptd_io_read total freelist %d\n", total_freelist);	
-				if(getfrom_freelist(NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR, io->freelist[i])) {
-					printk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in freelist %d\n", NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR, total_freelist);
-					crypt_dec_pending(io);
-					io->error = BLK_STS_IOERR;	
-					spin_unlock(&freelist_lock);
-					return 1;
+				//printk("kcryptd_io_read total freelist %d\n", total_freelist);	
+				// if reuse_public_sector is true, use the same physical sector as in the map
+				if((io->freelist[i][0].start = map_find(lsector, NULL, &reuse_public_sector)) == -1 || !reuse_public_sector) {
+					if(getfrom_freelist(NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR, io->freelist[i])) {
+						printk("kcryptd_io_read Unable to find contiguous %d public sectors for hidden write. Total elements in \
+								freelist %d\n", NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR, total_freelist);
+						crypt_dec_pending(io);
+						io->error = BLK_STS_IOERR;	
+						spin_unlock(&freelist_lock);
+						return 1;
+					}
+				}
+				else {
+					printk("kcryptd_io_read, PD_READ_DURING_HIDDEN_WRITE, mapping entry for sector %d found AND reuse public sector %d is true\n", \
+							lsector, reuse_public_sector);
 				}
 				spin_unlock(&freelist_lock);
-
-				//io->freelist[i][0].start = (i + io->base_bio->bi_iter.bi_sector)*NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR;
-				//io->freelist[i][0].len = 57;
 
 				//print_freelist();
 			}
 			// read list of sectors from map
 			else {
 				//assuming that we have NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR in freelist[i][0]
-				if((io->freelist[i][0].start = map_find(lsector, NULL)) == -1) {
+				if((io->freelist[i][0].start = map_find(lsector, NULL, NULL)) == -1) {
 					//printk("kcryptd_io_read Unable to find physical mapped sectors for %d\n", lsector);
 					//printk("Mapping the input sector to itself just to continue the read");
 					//anyhow the data read will be junk. See if we can optimize this and not
 					//go through the entire decryption process for this sector and just return some random data
 					io->freelist[i][0].start = lsector;
 				}
-				io->freelist[i][0].len = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR;				
 			}
+			io->freelist[i][0].len = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR;
 			//TODO: club adjacent sectors to increase performance
 			while(j < NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR && io->freelist[i][j].len) {
 				unsigned assigned = io->freelist[i][j].len * cc->sector_size;
@@ -2409,7 +2420,7 @@ static void kcryptd_io_rdwr_map(struct dm_crypt_io *io)
 	if (!io->freelist)
 		goto ret;
 	for(i = 0; i < bio_sectors(io->base_bio); i++) {
-		if (map_insert(sector, io->freelist[i][0].start, NULL))
+		if (map_insert(sector, io->freelist[i][0].start, NULL, true))
 			printk("kcryptd_io_rdwr_map, error inserting key %d, value %d into map", sector, io->freelist[i][0].start);
 		sector++;
 	}
@@ -2735,7 +2746,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 			unsigned short sequence_number;
 			int HIDDEN_BYTES_PER_TAG;
 
-			if (map_find(sector_num, &sequence_number) == -1)
+			if (map_find(sector_num, &sequence_number, NULL) == -1)
 				sequence_number = 1;
 			else
 				sequence_number++;
@@ -3033,8 +3044,10 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 			//ideally we would have liked not to decrypt this IV and re-encrypt it back
 			// but since the input may have dirty and non-dirty sectors, we take a decision here. 
 			// TODO: see if we can somehow not decrypt the IV of dirty sector
-			if (findin_dirty_list(sector))
+			if (findin_dirty_list(sector)) {
+				printk("kcryptd_crypt_read_convert, pub write, sector %d found in dirty list. Skipping!", sector);
 				goto advance;
+			}
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
 			bool found = false;
@@ -3092,7 +3105,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 					printk("cryptd_crypt_read_convert, pub write we got sector %d, sequence %d from 0th IV\n", sector_num, sequence_num);
 				}
 				//get the mapped physical sector number for this logical sector
-				if ((phy_sector = map_find(sector_num, &current_sequence_num)) != -1) {
+				if ((phy_sector = map_find(sector_num, &current_sequence_num, NULL)) != -1) {
 					if (sequence_num == current_sequence_num)
 						found = true;
 					printk("cryptd_crypt_read_convert, pub write, logical sector %d, physical sector %d, seq num %d, mapped seq num %d\n",
@@ -4562,17 +4575,17 @@ void process_map_data(struct crypt_config *cc)
 				}
 				if (expected_iv_offset == NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR) {
 	                        	unsigned short current_sequence_num;
-        	                	if (map_find(sector_num, &current_sequence_num) != -1) {
+        	                	if (map_find(sector_num, &current_sequence_num, NULL) != -1) {
                 	               		 if(sequence_num > current_sequence_num) {
 				       	 		printk("process_map_data, updating logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
 								sector_num, map_pub_sector, sequence_num, current_sequence_num); 
-							map_insert(sector_num, map_pub_sector, &sequence_num);
+							map_insert(sector_num, map_pub_sector, &sequence_num, false);
 						}
 					}
 					else {
 				        	printk("process_map_data, inserting logical sector %d, physical sector %d, sequence_num %u\n", 
 							sector_num, map_pub_sector, sequence_num); 
-						map_insert(sector_num, map_pub_sector, &sequence_num);
+						map_insert(sector_num, map_pub_sector, &sequence_num, false);
 					}
 				}
 			}
