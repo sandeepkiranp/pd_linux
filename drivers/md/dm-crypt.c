@@ -112,8 +112,8 @@ enum cipher_flags {
 #define IV_OFFSET_POS (IV_SIZE - PD_MAGIC_DATA_LEN - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN)
 #define CHUNK_NUM_SECTORS 32768 
 #define HIDDEN_BYTES_IN_FIRST_IV (IV_SIZE - PD_MAGIC_DATA_LEN - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN - SEQUENCE_NUMBER_LEN - SECTOR_NUM_LEN) //6
-#define HIDDEN_BYTES_IN_REST_IVS (IV_SIZE - PD_MAGIC_DATA_LEN - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN)  //12
-#define NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR 44 // ( 1 + (512 - HIDDEN_BYTES_IN_FIRST_IV) /HIDDEN_BYTES_IN_REST_IVS)
+#define HIDDEN_BYTES_IN_REST_IVS (IV_SIZE - PD_MAGIC_DATA_LEN - RANDOM_BYTES_PER_TAG - IV_OFFSET_LEN - SEQUENCE_NUMBER_LEN)  //10
+#define NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR 52 // ( 1 + (512 - HIDDEN_BYTES_IN_FIRST_IV) /HIDDEN_BYTES_IN_REST_IVS)
 #define REUSE_PHYSICAL_BIT 48
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
@@ -137,7 +137,7 @@ static void process_map_data(struct crypt_config *cc);
 static void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char *tag, int tag_size);
 static int read_sector_metadata(struct dm_crypt_io *io, struct bio *base_bio, sector_t sector, unsigned char *data, unsigned size);
 
-#define printk(f_, ...) 
+//#define printk(f_, ...) 
 
 void print_integrity_metadata(char *msg, char *data)
 {
@@ -2332,8 +2332,8 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 					}
 				}
 				else {
-					printk("kcryptd_io_read, PD_READ_DURING_HIDDEN_WRITE, mapping entry for sector %d found AND reuse public sector %d is true\n", \
-							lsector, reuse_public_sector);
+					printk("kcryptd_io_read, PD_READ_DURING_HIDDEN_WRITE, mapping entry for sector %d=%d AND reuse public sector %d is true\n", \
+							lsector, io->freelist[i][0].start, reuse_public_sector);
 				}
 				spin_unlock(&freelist_lock);
 
@@ -2444,6 +2444,9 @@ static void kcryptd_io_rdwr_map(struct dm_crypt_io *io)
 		if (map_find(sector, NULL, &reuse_physical_sector) == -1 || !reuse_physical_sector) {
 			if (map_insert(sector, io->freelist[i][0].start, NULL, true))
 				printk("kcryptd_io_rdwr_map, error inserting key %d, value %d into map", sector, io->freelist[i][0].start);
+			else
+				printk("kcryptd_io_rdwr_map, inserting key %d, value %d into map", sector, io->freelist[i][0].start);
+
 		}
 		sector++;
 	}
@@ -2809,9 +2812,10 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 				is_first_iv = false;
 			}
 			else {
-				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG] = iv_offset;
-				memset(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN, 0, RANDOM_BYTES_PER_TAG);
-				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG  + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+				memcpy(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, &sequence_number, SEQUENCE_NUMBER_LEN);
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SEQUENCE_NUMBER_LEN] = iv_offset;
+				memset(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN, 0, RANDOM_BYTES_PER_TAG);
+				dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG  + SEQUENCE_NUMBER_LEN + IV_OFFSET_LEN + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
 			}
 
 			bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
@@ -4853,8 +4857,8 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
 
-	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
-		process_map_data(cc);
+	//if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
+	//	process_map_data(cc);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
