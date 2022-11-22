@@ -4487,151 +4487,185 @@ static int test_hash(const unsigned char *data, unsigned int datalen,
     return ret;
 }
 
-void process_map_data(struct crypt_config *cc)
+void map_common(struct crypt_config *cc, sector_t start, sector_t end)
 {
-	char *tag;
-	sector_t current_sector = 0;
-	struct dm_crypt_io *io; //dummy io object. needed as crypt_convert depends on it for few members. not elegant
-	int tag_offset = 0;
-	int tag_size, r;
-	struct bio *bio;
-	unsigned int nr_iovecs;
-	gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
-	unsigned i, len, remaining_size;
-	struct page *page;
-	int ret = 0;
-	unsigned max_sectors = 0;
-	unsigned act_sectors;
-	int iv_offset = 0;
-	int expected_iv_offset = 0;
-	unsigned sector_num = 0;
-	unsigned short sequence_num = 0;
-	unsigned map_pub_sector = 0;
+        sector_t current_sector = start;
+        unsigned max_sectors = end;
+        char *tag;
+        struct dm_crypt_io *io; //dummy io object. needed as crypt_convert depends on it for few members. not elegant
+        int tag_offset = 0;
+        int tag_size, r;
+        struct bio *bio;
+        unsigned int nr_iovecs;
+        gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
+        unsigned i, len, remaining_size;
+        struct page *page;
+        int ret = 0;
+        unsigned act_sectors;
+        int iv_offset = 0;
+        int expected_iv_offset = 0;
+        unsigned sector_num = 0;
+        unsigned short sequence_num = 0;
+        unsigned map_pub_sector = 0;
+        static struct task_struct *map_thread;
 
-	get_map_data(0, 0, 0, &max_sectors); 
-	printk("process_map_data, max_sectors %d\n", max_sectors);
+	printk("map_common, entering\n");
 
-	io = (struct dm_crypt_io *)kmalloc(cc->per_bio_data_size, GFP_KERNEL);
+        io = (struct dm_crypt_io *)kmalloc(cc->per_bio_data_size, GFP_KERNEL);
 
-	io->cc = cc;
-	tag_size = CHUNK_NUM_SECTORS * cc->on_disk_tag_size;
-	tag = kvmalloc(tag_size, GFP_KERNEL);
-	if (!tag) {
-		printk("process_map_data, Error allocating tag");
-		return;
-	}
+        io->cc = cc;
+        tag_size = CHUNK_NUM_SECTORS * cc->on_disk_tag_size;
+        tag = kvmalloc(tag_size, GFP_KERNEL);
+        if (!tag) {
+                printk("map_common, Error allocating tag");
+                return;
+        }
 
-	nr_iovecs = (tag_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_READ, GFP_NOIO, &cc->bs);
-	if (unlikely(!bio)) {
-		io->error = BLK_STS_IOERR;
-		printk("process_map_data, Error allocating bio");
-		return;
-	}
-	remaining_size = tag_size;
+        nr_iovecs = (tag_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+        bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_READ, GFP_NOIO, &cc->bs);
+        if (unlikely(!bio)) {
+                io->error = BLK_STS_IOERR;
+                printk("map_common, Error allocating bio");
+                return;
+        }
+        remaining_size = tag_size;
 
-	for (i = 0; i < nr_iovecs; i++) {
-		page = mempool_alloc(&cc->page_pool, gfp_mask);
-		if (!page) {
-			printk("Error allocating a page");
-			return;
-		}
+        for (i = 0; i < nr_iovecs; i++) {
+                page = mempool_alloc(&cc->page_pool, gfp_mask);
+                if (!page) {
+                        printk("Error allocating a page");
+                        return;
+                }
 
-		len = (remaining_size > PAGE_SIZE) ? PAGE_SIZE : remaining_size;
+                len = (remaining_size > PAGE_SIZE) ? PAGE_SIZE : remaining_size;
 
-		ret = bio_add_page(bio, page, len, 0);
+                ret = bio_add_page(bio, page, len, 0);
 
-		remaining_size -= len;
-	}
-	bio->bi_opf = REQ_OP_READ;
-	io->flags |= PD_HIDDEN_OPERATION | PD_READ_MAP_DATA;
+                remaining_size -= len;
+        }
+        bio->bi_opf = REQ_OP_READ;
+        io->flags |= PD_HIDDEN_OPERATION | PD_READ_MAP_DATA;
 
-	while(current_sector < max_sectors) {
-		act_sectors = min((sector_t)CHUNK_NUM_SECTORS, max_sectors - current_sector);
-		tag_size = act_sectors * cc->on_disk_tag_size;
-		memset(tag, 0, tag_size);
-		get_map_data(current_sector, tag, tag_size, NULL);
-		//printk("process_map_data sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
-		//		current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
+        while(current_sector < max_sectors) {
+                act_sectors = min((sector_t)CHUNK_NUM_SECTORS, max_sectors - current_sector);
+                tag_size = act_sectors * cc->on_disk_tag_size;
+                memset(tag, 0, tag_size);
+                get_map_data(current_sector, tag, tag_size, NULL);
+                //printk("map_common sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
+                //              current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
+                if (crypt_integrity_aead(cc))
+                        io->ctx.r.req_aead = (struct aead_request *)(io + 1);
+                else
+                        io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
-		if (crypt_integrity_aead(cc))
-			io->ctx.r.req_aead = (struct aead_request *)(io + 1);
-		else
-			io->ctx.r.req = (struct skcipher_request *)(io + 1);
-
-		struct bvec_iter iter_out = bio->bi_iter;
-		unsigned offset = 0;
-		while (iter_out.bi_size) {
-			struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
-			char *buffer = page_to_virt(bv_out.bv_page);
-
-			memcpy(buffer + bv_out.bv_offset, tag + offset, cc->on_disk_tag_size);
-			bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
-			offset += cc->on_disk_tag_size;
-		}
-		
-		crypt_convert_init(cc, &io->ctx, bio, bio, current_sector, &tag_offset);
-		r = crypt_convert(cc, &io->ctx,
-				test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
-		if (r){
-			printk("crypt_convert failed");
-			io->error = r; //TODO: free everything and return failure
-		}
-                iter_out = bio->bi_iter;
-                offset = 0;
-		unsigned pub_sector = current_sector;
-		//print_bio("Data during initialization", bio);
+                struct bvec_iter iter_out = bio->bi_iter;
+                unsigned offset = 0;
                 while (iter_out.bi_size) {
                         struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
                         char *buffer = page_to_virt(bv_out.bv_page);
 
-			if ((unsigned char)buffer[bv_out.bv_offset + PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
-				iv_offset = (unsigned char)buffer[bv_out.bv_offset + IV_OFFSET_POS];
-				if (iv_offset == 0)
-					expected_iv_offset = 0;
-				if (iv_offset != expected_iv_offset) {
-					expected_iv_offset = 0;
-					goto next;
-				}
-				else
-					expected_iv_offset++;
+                        memcpy(buffer + bv_out.bv_offset, tag + offset, cc->on_disk_tag_size);
+                        bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
+                        offset += cc->on_disk_tag_size;
+                }
 
-				if (iv_offset == 0) {
-					int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
-                        		memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
-					memcpy(&sequence_num , buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
-					map_pub_sector = pub_sector;
-				}
-				if (expected_iv_offset == NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR) {
-	                        	unsigned short current_sequence_num;
-        	                	if (map_find(sector_num, &current_sequence_num, NULL) != -1) {
-                	               		 if(sequence_num > current_sequence_num) {
-				       	 		printk("process_map_data, updating logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n", 
-								sector_num, map_pub_sector, sequence_num, current_sequence_num); 
-							map_insert(sector_num, map_pub_sector, &sequence_num, false);
-						}
-					}
-					else {
-				        	printk("process_map_data, inserting logical sector %d, physical sector %d, sequence_num %u\n", 
-							sector_num, map_pub_sector, sequence_num); 
-						map_insert(sector_num, map_pub_sector, &sequence_num, false);
-					}
-				}
-			}
+                crypt_convert_init(cc, &io->ctx, bio, bio, current_sector, &tag_offset);
+                r = crypt_convert(cc, &io->ctx,
+                                test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+                if (r){
+                        printk("crypt_convert failed");
+                        io->error = r; //TODO: free everything and return failure
+                }
+                iter_out = bio->bi_iter;
+                offset = 0;
+                unsigned pub_sector = current_sector;
+                //print_bio("Data during initialization", bio);
+                while (iter_out.bi_size) {
+                        struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+                        char *buffer = page_to_virt(bv_out.bv_page);
+
+                        if ((unsigned char)buffer[bv_out.bv_offset + PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
+                                iv_offset = (unsigned char)buffer[bv_out.bv_offset + IV_OFFSET_POS];
+                                if (iv_offset == 0)
+                                        expected_iv_offset = 0;
+                                if (iv_offset != expected_iv_offset) {
+                                        expected_iv_offset = 0;
+                                        goto next;
+                                }
+                                else
+                                        expected_iv_offset++;
+                                if (iv_offset == 0) {
+                                        int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
+                                        memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                                        memcpy(&sequence_num , buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+                                        map_pub_sector = pub_sector;
+                                }
+                                if (expected_iv_offset == NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR) {
+                                        unsigned short current_sequence_num;
+                                        if (map_find(sector_num, &current_sequence_num, NULL) != -1) {
+                                                 if(sequence_num > current_sequence_num) {
+                                                        printk("map_common, updating logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n",
+                                                                sector_num, map_pub_sector, sequence_num, current_sequence_num);
+                                                        map_insert(sector_num, map_pub_sector, &sequence_num, false);
+                                                }
+                                        }
+                                        else {
+                                                printk("map_common, inserting logical sector %d, physical sector %d, sequence_num %u\n",
+                                                        sector_num, map_pub_sector, sequence_num);
+                                                map_insert(sector_num, map_pub_sector, &sequence_num, false);
+                                        }
+                                }
+                        }
 
 next:
                         bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
                         offset += cc->on_disk_tag_size;
-			pub_sector++;
+                        pub_sector++;
                 }
 
-		current_sector += act_sectors;
-		tag_offset = 0;
-	}
+                current_sector += act_sectors;
+                tag_offset = 0;
+        }
 
-	crypt_free_buffer_pages(cc, bio);
-	bio_put(bio);
-	kfree(io);
+        crypt_free_buffer_pages(cc, bio);
+        bio_put(bio);
+        kfree(io);
+        printk("map_common exiting\n");
+}
+
+struct my_struct {
+	struct crypt_config *cc;
+	unsigned max_sectors;
+};
+
+static int map_data_thread(void *data)
+{
+	struct my_struct *mys = (struct my_struct *)data;
+	printk("map_data_thread, entering!\n");
+	map_common(mys->cc, mys->max_sectors/2 + 1, mys->max_sectors);
+	printk("map_data_thread, exiting!\n");
+	return 0;
+}
+
+void process_map_data(struct crypt_config *cc)
+{
+	unsigned max_sectors = 0;
+	static struct task_struct *map_thread;
+	struct my_struct mys;
+
+	get_map_data(0, 0, 0, &max_sectors); 
+	printk("process_map_data, max_sectors %d\n", max_sectors);
+
+	mys.cc = cc;
+	mys.max_sectors = max_sectors;
+
+        map_thread = kthread_run(map_data_thread, &mys, "map_data_thread", NULL);
+        if (IS_ERR(map_thread)) {
+		printk("process_map_data, error spawning map_thread");
+		return;
+        }
+
+	map_common(cc, 0, max_sectors/2);
 	printk("process_map_data decrypted integrity metadata\n");
 }
 
@@ -4858,8 +4892,8 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	bio_file = file_open("/tmp/bio", O_CREAT|O_WRONLY, 0);
 
-	//if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
-	//	process_map_data(cc);
+	if (!test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags))
+		process_map_data(cc);
 
 	ti->num_flush_bios = 1;
 	ti->limit_swap_bios = true;
@@ -4944,13 +4978,6 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	else
 		io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
-	/*
-	   if (test_bit(DM_CRYPT_STORE_DATA_IN_INTEGRITY_MD, &cc->flags) && (bio_data_dir(bio) != READ)) {
-	   bio_endio(io->base_bio);
-	   return DM_MAPIO_SUBMITTED;	
-	   }
-
-*/
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, CRYPT_MAP_READ_GFP))
 			kcryptd_queue_read(io);
