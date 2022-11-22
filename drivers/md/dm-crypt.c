@@ -137,7 +137,7 @@ static void process_map_data(struct crypt_config *cc);
 static void get_ivs_from_sector(struct dm_crypt_io *io, sector_t sector, unsigned char *tag, int tag_size);
 static int read_sector_metadata(struct dm_crypt_io *io, struct bio *base_bio, sector_t sector, unsigned char *data, unsigned size);
 
-//#define printk(f_, ...) 
+#define printk(f_, ...) 
 
 void print_integrity_metadata(char *msg, char *data)
 {
@@ -2255,8 +2255,8 @@ int map_insert(unsigned sector, unsigned value, unsigned short *lseq_num, bool r
 		complete = complete | ((unsigned long)1 << REUSE_PHYSICAL_BIT);
 	r = idr_alloc(&map_idr, (void *)complete, sector, sector + 1, GFP_NOWAIT);
 
-	spin_unlock(&map_lock);
 	idr_preload_end();
+	spin_unlock(&map_lock);
 	if (r < 0)
 		return r == -ENOSPC ? -EBUSY : r;
 	printk("map_insert, Inserted key %d, value %d, seq_num %d, complete %ld", sector, value, seq_num, complete);
@@ -2330,11 +2330,12 @@ static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
 						spin_unlock(&freelist_lock);
 						return 1;
 					}
-				}
+				} /*
 				else {
 					printk("kcryptd_io_read, PD_READ_DURING_HIDDEN_WRITE, mapping entry for sector %d=%d AND reuse public sector %d is true\n", \
 							lsector, io->freelist[i][0].start, reuse_public_sector);
 				}
+				*/
 				spin_unlock(&freelist_lock);
 
 				//print_freelist();
