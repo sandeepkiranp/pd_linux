@@ -4609,9 +4609,9 @@ void map_common(struct crypt_config *cc, sector_t start, sector_t end)
                                 map_pub_sector = current_sector;
                         }
 			else {
-				/* get first two IVs in the sequence and check their sanity */
 				if (iv_offset >= NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR || (current_sector - iv_offset) < 0)
 					goto next;
+				/* get first two IVs in the sequence and check their sanity */
 				get_IVs(cc, current_sector - iv_offset, sanity_ivs, sizeof(sanity_ivs));
 				if (iv1[PD_MAGIC_DATA_POS] != PD_MAGIC_DATA || iv2[PD_MAGIC_DATA_POS] != PD_MAGIC_DATA ||
 				    iv1[IV_OFFSET_POS] != 0 || iv2[IV_OFFSET_POS] != 1 ||
