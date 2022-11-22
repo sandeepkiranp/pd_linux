@@ -4487,39 +4487,20 @@ static int test_hash(const unsigned char *data, unsigned int datalen,
     return ret;
 }
 
-void map_common(struct crypt_config *cc, sector_t start, sector_t end)
+void get_IVs(struct crypt_config *cc, sector_t sector, unsigned char *tag, int tag_size)
 {
-        sector_t current_sector = start;
-        unsigned max_sectors = end;
-        char *tag;
         struct dm_crypt_io *io; //dummy io object. needed as crypt_convert depends on it for few members. not elegant
         int tag_offset = 0;
-        int tag_size, r;
         struct bio *bio;
         unsigned int nr_iovecs;
         gfp_t gfp_mask = GFP_NOWAIT | __GFP_HIGHMEM;
         unsigned i, len, remaining_size;
         struct page *page;
         int ret = 0;
-        unsigned act_sectors;
-        int iv_offset = 0;
-        int expected_iv_offset = 0;
-        unsigned sector_num = 0;
-        unsigned short sequence_num = 0;
-        unsigned map_pub_sector = 0;
-        static struct task_struct *map_thread;
-
-	printk("map_common, entering\n");
 
         io = (struct dm_crypt_io *)kmalloc(cc->per_bio_data_size, GFP_KERNEL);
 
         io->cc = cc;
-        tag_size = CHUNK_NUM_SECTORS * cc->on_disk_tag_size;
-        tag = kvmalloc(tag_size, GFP_KERNEL);
-        if (!tag) {
-                printk("map_common, Error allocating tag");
-                return;
-        }
 
         nr_iovecs = (tag_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
         bio = bio_alloc_bioset(cc->dev->bdev, nr_iovecs, REQ_OP_READ, GFP_NOIO, &cc->bs);
@@ -4546,90 +4527,123 @@ void map_common(struct crypt_config *cc, sector_t start, sector_t end)
         bio->bi_opf = REQ_OP_READ;
         io->flags |= PD_HIDDEN_OPERATION | PD_READ_MAP_DATA;
 
-        while(current_sector < max_sectors) {
-                act_sectors = min((sector_t)CHUNK_NUM_SECTORS, max_sectors - current_sector);
-                tag_size = act_sectors * cc->on_disk_tag_size;
-                memset(tag, 0, tag_size);
-                get_map_data(current_sector, tag, tag_size, NULL);
-                //printk("map_common sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
-                //              current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
-                if (crypt_integrity_aead(cc))
-                        io->ctx.r.req_aead = (struct aead_request *)(io + 1);
-                else
-                        io->ctx.r.req = (struct skcipher_request *)(io + 1);
+        memset(tag, 0, tag_size);
+        get_map_data(sector, tag, tag_size, NULL);
+        //printk("map_common sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
+        //              current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
+        if (crypt_integrity_aead(cc))
+                io->ctx.r.req_aead = (struct aead_request *)(io + 1);
+        else
+                io->ctx.r.req = (struct skcipher_request *)(io + 1);
 
-                struct bvec_iter iter_out = bio->bi_iter;
-                unsigned offset = 0;
-                while (iter_out.bi_size) {
-                        struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
-                        char *buffer = page_to_virt(bv_out.bv_page);
+        struct bvec_iter iter_out = bio->bi_iter;
+        unsigned offset = 0;
+        while (iter_out.bi_size) {
+                struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+                char *buffer = page_to_virt(bv_out.bv_page);
 
-                        memcpy(buffer + bv_out.bv_offset, tag + offset, cc->on_disk_tag_size);
-                        bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
-                        offset += cc->on_disk_tag_size;
-                }
-
-                crypt_convert_init(cc, &io->ctx, bio, bio, current_sector, &tag_offset);
-                r = crypt_convert(cc, &io->ctx,
-                                test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
-                if (r){
-                        printk("crypt_convert failed");
-                        io->error = r; //TODO: free everything and return failure
-                }
-                iter_out = bio->bi_iter;
-                offset = 0;
-                unsigned pub_sector = current_sector;
-                //print_bio("Data during initialization", bio);
-                while (iter_out.bi_size) {
-                        struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
-                        char *buffer = page_to_virt(bv_out.bv_page);
-
-                        if ((unsigned char)buffer[bv_out.bv_offset + PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
-                                iv_offset = (unsigned char)buffer[bv_out.bv_offset + IV_OFFSET_POS];
-                                if (iv_offset == 0)
-                                        expected_iv_offset = 0;
-                                if (iv_offset != expected_iv_offset) {
-                                        expected_iv_offset = 0;
-                                        goto next;
-                                }
-                                else
-                                        expected_iv_offset++;
-                                if (iv_offset == 0) {
-                                        int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
-                                        memcpy(&sector_num, buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
-                                        memcpy(&sequence_num , buffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
-                                        map_pub_sector = pub_sector;
-                                }
-                                if (expected_iv_offset == NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR) {
-                                        unsigned short current_sequence_num;
-                                        if (map_find(sector_num, &current_sequence_num, NULL) != -1) {
-                                                 if(sequence_num > current_sequence_num) {
-                                                        printk("map_common, updating logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n",
-                                                                sector_num, map_pub_sector, sequence_num, current_sequence_num);
-                                                        map_insert(sector_num, map_pub_sector, &sequence_num, false);
-                                                }
-                                        }
-                                        else {
-                                                printk("map_common, inserting logical sector %d, physical sector %d, sequence_num %u\n",
-                                                        sector_num, map_pub_sector, sequence_num);
-                                                map_insert(sector_num, map_pub_sector, &sequence_num, false);
-                                        }
-                                }
-                        }
-
-next:
-                        bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
-                        offset += cc->on_disk_tag_size;
-                        pub_sector++;
-                }
-
-                current_sector += act_sectors;
-                tag_offset = 0;
+                memcpy(buffer + bv_out.bv_offset, tag + offset, cc->on_disk_tag_size);
+                bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
+                offset += cc->on_disk_tag_size;
         }
 
+        crypt_convert_init(cc, &io->ctx, bio, bio, sector, &tag_offset);
+        int r = crypt_convert(cc, &io->ctx,
+                        test_bit(DM_CRYPT_NO_READ_WORKQUEUE, &cc->flags), true);
+        if (r){
+                printk("crypt_convert failed");
+                io->error = r; //TODO: free everything and return failure
+        }
+        iter_out = bio->bi_iter;
+        offset = 0;
+        //print_bio("Data during initialization", bio);
+        while (iter_out.bi_size) {
+                struct bio_vec bv_out = bio_iter_iovec(bio, iter_out);
+                char *buffer = page_to_virt(bv_out.bv_page);
+		memcpy(tag + offset, buffer + bv_out.bv_offset, cc->on_disk_tag_size);
+                bio_advance_iter(bio, &iter_out, cc->on_disk_tag_size);
+                offset += cc->on_disk_tag_size;
+        }
         crypt_free_buffer_pages(cc, bio);
         bio_put(bio);
         kfree(io);
+}
+
+void map_common(struct crypt_config *cc, sector_t start, sector_t end)
+{
+        sector_t current_sector = start;
+        unsigned max_sectors = end;
+        unsigned char tag[IV_SIZE];
+	unsigned int tag_size = IV_SIZE;
+        int iv_offset = 0;
+        unsigned sector_num = 0;
+        unsigned short sequence_num = 0;
+        unsigned map_pub_sector = 0;
+        unsigned char sanity_ivs[2*IV_SIZE] = {0};
+        unsigned char *iv1 = sanity_ivs, *iv2 = sanity_ivs + IV_SIZE;
+	int increment_index;
+
+	printk("map_common, entering\n");
+
+        while(current_sector < max_sectors) {
+                memset(tag, 0, tag_size);
+                get_IVs(cc, current_sector, tag, tag_size);
+		increment_index = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR;
+                //printk("map_common sector %d, tag[0] = %02hhx, tag[1] = %02hhx, tag[2] = %02hhx, tag[3] = %02hhx, tag[4] = %02hhx\n",
+                //              current_sector, tag[0], tag[1], tag[2], tag[3], tag[4]);
+		
+                if ((unsigned char)tag[PD_MAGIC_DATA_POS] == PD_MAGIC_DATA) {
+                        iv_offset = (unsigned char)tag[IV_OFFSET_POS];
+                        if (iv_offset == 0) {
+				/* get next two IVs and confirm their sanity. IV offsets and PWC check */
+                                get_IVs(cc, current_sector + 1, sanity_ivs, sizeof(sanity_ivs));
+                                if (iv1[PD_MAGIC_DATA_POS] != PD_MAGIC_DATA || iv2[PD_MAGIC_DATA_POS] != PD_MAGIC_DATA ||
+                                    iv1[IV_OFFSET_POS] != 1 || iv2[IV_OFFSET_POS] != 2 ||
+                                    iv1[RANDOM_BYTES_POS] != iv2[RANDOM_BYTES_POS] ||
+                                    iv1[RANDOM_BYTES_POS + 1] != iv2[RANDOM_BYTES_POS])
+                                        goto next;
+				//all good. extract the data from tag
+                                int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
+                                memcpy(&sector_num, tag + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                                memcpy(&sequence_num , tag + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+                                map_pub_sector = current_sector;
+                        }
+			else {
+				/* get first two IVs in the sequence and check their sanity */
+				if (iv_offset >= NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR || (current_sector - iv_offset) < 0)
+					goto next;
+				get_IVs(cc, current_sector - iv_offset, sanity_ivs, sizeof(sanity_ivs));
+				if (iv1[PD_MAGIC_DATA_POS] != PD_MAGIC_DATA || iv2[PD_MAGIC_DATA_POS] != PD_MAGIC_DATA ||
+				    iv1[IV_OFFSET_POS] != 0 || iv2[IV_OFFSET_POS] != 1 ||
+				    iv1[RANDOM_BYTES_POS] != iv2[RANDOM_BYTES_POS] ||
+				    iv1[RANDOM_BYTES_POS + 1] != iv2[RANDOM_BYTES_POS])
+					goto next;
+				//everything is fine so far. extract data from iv1
+                                int HIDDEN_BYTES_PER_TAG = HIDDEN_BYTES_IN_FIRST_IV;
+                                memcpy(&sector_num, iv1 + HIDDEN_BYTES_PER_TAG, SECTOR_NUM_LEN);
+                                memcpy(&sequence_num , iv1 + HIDDEN_BYTES_PER_TAG + SECTOR_NUM_LEN, SEQUENCE_NUMBER_LEN);
+                                map_pub_sector = current_sector - iv_offset;
+				increment_index = NUM_PUBLIC_SECTORS_PER_HIDDEN_SECTOR - iv_offset;
+			}
+
+                        unsigned short current_sequence_num;
+                        if (map_find(sector_num, &current_sequence_num, NULL) != -1) {
+                                 if(sequence_num > current_sequence_num) {
+                                        printk("map_common, updating logical sector %d, physical sector %d, sequence_num %u, current_seq %u\n",
+                                                sector_num, map_pub_sector, sequence_num, current_sequence_num);
+                                        map_insert(sector_num, map_pub_sector, &sequence_num, false);
+                                 }
+                        }
+                        else {
+                                printk("map_common, inserting logical sector %d, physical sector %d, sequence_num %u\n",
+                                        sector_num, map_pub_sector, sequence_num);
+                                map_insert(sector_num, map_pub_sector, &sequence_num, false);
+                        }
+                }
+next:
+                current_sector += increment_index;
+        }
+
         printk("map_common exiting\n");
 }
 
