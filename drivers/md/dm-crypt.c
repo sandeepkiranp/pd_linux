@@ -4652,11 +4652,11 @@ struct my_struct {
 	unsigned max_sectors;
 	int index;
 };
-#define MAX_THREADS 5
+#define MAX_THREADS 12 //tested with 6 cores 
 static int map_data_thread(void *data)
 {
 	struct my_struct *mys = (struct my_struct *)data;
-	printk("map_data_thread %d, entering!\n", mys->index);
+	//printk("map_data_thread %d, entering!\n", mys->index);
 	map_common(mys->cc, (mys->max_sectors * mys->index)/MAX_THREADS, ((mys->max_sectors * (mys->index + 1))/MAX_THREADS) - 1);
 	printk("map_data_thread %d, exiting!\n", mys->index);
 	return 0;
@@ -4669,9 +4669,9 @@ void process_map_data(struct crypt_config *cc)
 	static struct task_struct *map_thread;
 	int i;
 
+	printk("process_map_data, entering");
 	get_map_data(0, 0, 0, &max_sectors); 
 	printk("process_map_data, max_sectors %d\n", max_sectors);
-
 
 	for (i = 0; i < MAX_THREADS - 1; i++) {
 		mys[i].index = i;
