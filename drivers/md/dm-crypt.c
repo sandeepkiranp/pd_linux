@@ -4650,36 +4650,41 @@ next:
 struct my_struct {
 	struct crypt_config *cc;
 	unsigned max_sectors;
+	int index;
 };
-
+#define MAX_THREADS 5
 static int map_data_thread(void *data)
 {
 	struct my_struct *mys = (struct my_struct *)data;
-	printk("map_data_thread, entering!\n");
-	map_common(mys->cc, mys->max_sectors/2 + 1, mys->max_sectors);
-	printk("map_data_thread, exiting!\n");
+	printk("map_data_thread %d, entering!\n", mys->index);
+	map_common(mys->cc, (mys->max_sectors * mys->index)/MAX_THREADS, ((mys->max_sectors * (mys->index + 1))/MAX_THREADS) - 1);
+	printk("map_data_thread %d, exiting!\n", mys->index);
 	return 0;
 }
 
+struct my_struct mys[MAX_THREADS];
 void process_map_data(struct crypt_config *cc)
 {
 	unsigned max_sectors = 0;
 	static struct task_struct *map_thread;
-	struct my_struct mys;
+	int i;
 
 	get_map_data(0, 0, 0, &max_sectors); 
 	printk("process_map_data, max_sectors %d\n", max_sectors);
 
-	mys.cc = cc;
-	mys.max_sectors = max_sectors;
 
-        map_thread = kthread_run(map_data_thread, &mys, "map_data_thread", NULL);
-        if (IS_ERR(map_thread)) {
-		printk("process_map_data, error spawning map_thread");
-		return;
-        }
+	for (i = 0; i < MAX_THREADS - 1; i++) {
+		mys[i].index = i;
+		mys[i].cc = cc;
+		mys[i].max_sectors = max_sectors;
+        	map_thread = kthread_run(map_data_thread, &mys[i], "map_data_thread", NULL);
+        	if (IS_ERR(map_thread)) {
+			printk("process_map_data, error spawning map_thread");
+			return;
+        	}
+	}
 
-	map_common(cc, 0, max_sectors/2);
+	map_common(cc, (max_sectors * (MAX_THREADS - 1))/MAX_THREADS, max_sectors -1);
 	printk("process_map_data decrypted integrity metadata\n");
 }
 
