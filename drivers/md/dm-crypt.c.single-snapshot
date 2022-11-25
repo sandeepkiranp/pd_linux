@@ -1596,11 +1596,13 @@ static int crypt_convert_block_skcipher(struct crypt_config *cc,
 		/* Working copy of IV, to be modified in crypto API */
 		memcpy(iv, org_iv, cc->iv_size);
 	}
+	/*
 	if (io->flags & PD_HIDDEN_OPERATION) {
 		char *str = print_binary_data(iv, cc->iv_size);
 		//printk("crypt_convert_block_skcipher IV %s, %s\n", (bio_data_dir(ctx->bio_in) == WRITE) ? "WRITE" : "READ", str);
 		kfree(str);
 	}
+	*/
 	skcipher_request_set_crypt(req, sg_in, sg_out, data_len, iv);
 
 	if (bio_data_dir(ctx->bio_in) == WRITE)
@@ -2099,7 +2101,7 @@ static void crypt_endio(struct bio *clone)
                                 offset += cc->on_disk_tag_size;
                         }
 
-                        print_bio("Inside crypt_endio, hidden data before decryption", bio);
+                        //print_bio("Inside crypt_endio, hidden data before decryption", bio);
 
                         //print_integrity_metadata("Inside crypt_endio", io->integrity_metadata);
                         //print_bio("Inside crypt_endio", io->base_bio);
@@ -2564,7 +2566,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
                 io->flags |= PD_HIDDEN_OPERATION;
 
-		print_bio("write_convert after randombytes and magic", clone);
+		//print_bio("write_convert after randombytes and magic", clone);
 	}
 	else if (!(io->flags & PD_READ_DURING_PUBLIC_WRITE)) {
                 printk("PD initiating READ during PUBLIC WRITE\n");
@@ -2780,7 +2782,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
-		print_bio("kcryptd_crypt_read_convert, after decrypting hidden data", io->ctx.bio_out);
+		//print_bio("kcryptd_crypt_read_convert, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
@@ -2862,7 +2864,7 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
                 offset += cc->on_disk_tag_size;
 		//printk("offset %d, bv_offset %d\n", offset, bv_out.bv_offset);
             }
-	    print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
+	    //print_bio("kcryptd_crypt_read_convert, encrypted hidden data", io->write_ctx_bio);
 
 	    //free the original write ctx buffer
 	    crypt_free_buffer_pages(cc, io->write_ctx_bio);
