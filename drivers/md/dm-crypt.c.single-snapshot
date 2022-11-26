@@ -248,8 +248,8 @@ struct crypt_config {
 #define MAX_TAG_SIZE	480
 #define POOL_ENTRY_SIZE	512
 
-#define HIDDEN_BYTES_PER_TAG 13
-#define RANDOM_BYTES_PER_TAG 2
+#define HIDDEN_BYTES_PER_TAG 14
+#define IV_OFFSET_LEN 1 
 #define PD_MAGIC_DATA        0xAA
 
 static DEFINE_SPINLOCK(dm_crypt_clients_lock);
@@ -2528,6 +2528,7 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
 	        struct bvec_iter iter_in = io->base_bio->bi_iter;
 	        struct bvec_iter iter_out = clone->bi_iter;
+		unsigned char iv_offset = 0;
                 while (iter_in.bi_size) {
                     struct bio_vec bv_in = bio_iter_iovec(io->base_bio, iter_in);
                     struct bio_vec bv_out = bio_iter_iovec(clone, iter_out);
@@ -2551,15 +2552,18 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 		        /* Hiddenbytes | RandomBytes | Magic */
                         memcpy(dbuffer + bv_out.bv_offset, sbuffer + bv_in.bv_offset, copy_bytes);
 		    }
-		    memset(dbuffer + bv_out.bv_offset + HIDDEN_BYTES_PER_TAG, 0, RANDOM_BYTES_PER_TAG);
-		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] = PD_MAGIC_DATA;
+		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG] = iv_offset;
+		    dbuffer[bv_out.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN] = PD_MAGIC_DATA;
 
                     bio_advance_iter(io->base_bio, &iter_in, copy_bytes);
                     bio_advance_iter(clone, &iter_out, cc->on_disk_tag_size);
+		    iv_offset++;
 		    kunmap_atomic(sbuffer);
 		    total_copied += copy_bytes;
-		    if (total_copied == cc->sector_size)
+		    if (total_copied == cc->sector_size) {
 			total_copied = 0;
+			iv_offset = 0;
+		    }
                 }
 
                 crypt_convert_init(cc, ctx, clone, clone, num_sectors * sector, &tag_offset);
@@ -2782,24 +2786,20 @@ static void kcryptd_crypt_read_convert(struct dm_crypt_io *io)
 
 	if (io->flags & PD_READ_DURING_PUBLIC_WRITE) {
 		struct bvec_iter iter_in = io->ctx.bio_out->bi_iter;
+		unsigned sector = io->write_bio->bi_iter.bi_sector;
+		unsigned num_sectors = (cc->sector_size % HIDDEN_BYTES_PER_TAG) ? (cc->sector_size / HIDDEN_BYTES_PER_TAG) + 1: (cc->sector_size / HIDDEN_BYTES_PER_TAG);
 		//print_bio("kcryptd_crypt_read_convert, after decrypting hidden data", io->ctx.bio_out);
 		while (iter_in.bi_size) {
 			struct bio_vec bv_in = bio_iter_iovec(io->ctx.bio_out, iter_in);
 			char *buffer = page_to_virt(bv_in.bv_page);
-			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG] == PD_MAGIC_DATA) {
-				unsigned short counter = 0;
-				memcpy(&counter, buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, RANDOM_BYTES_PER_TAG);
-				counter++;
-                                //increment the public counter
-                                printk("Inside kcryptd_crypt_read_convert, incrementing public write counter in IV for sector %d to %d\n", sector, counter);
-                                memcpy(buffer + bv_in.bv_offset + HIDDEN_BYTES_PER_TAG, &counter, RANDOM_BYTES_PER_TAG);
-			}
-			else {
-				printk("No hidden data present (magic %02hhx), generating random IV\n", buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + RANDOM_BYTES_PER_TAG]);
+			if((unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN] != PD_MAGIC_DATA && 
+			  (sector % num_sectors != (unsigned char)buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG])) {
+				printk("No hidden data present (magic %02hhx), generating random IV\n", buffer[bv_in.bv_offset + HIDDEN_BYTES_PER_TAG + IV_OFFSET_LEN]);
 				//fill random bytes in IV
 				get_random_bytes(buffer + bv_in.bv_offset, cc->on_disk_tag_size);
 			}
 			bio_advance_iter(io->ctx.bio_out, &iter_in, cc->on_disk_tag_size);
+			sector++;
 		}
 		//re-encrypt the bio
 		struct bio *bio = io->ctx.bio_out;
